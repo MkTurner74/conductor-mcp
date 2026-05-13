@@ -21,6 +21,18 @@ async def ping() -> str:
 
 
 @mcp.tool()
+async def debug_config() -> str:
+    """Show server configuration state — no sensitive values exposed."""
+    return json.dumps({
+        "dashboard_url": conductor.CONDUCTOR_DASHBOARD_URL,
+        "api_url": conductor.CONDUCTOR_API_URL,
+        "has_client_id": bool(conductor._key_data.get("client_id")),
+        "has_private_key": bool(conductor._key_data.get("private_key")),
+        "private_key_starts_with": (conductor._key_data.get("private_key", "")[:30] if conductor._key_data.get("private_key") else "MISSING"),
+    }, indent=2)
+
+
+@mcp.tool()
 async def list_instance_types() -> str:
     """
     List all available hardware instance types on Conductor.
