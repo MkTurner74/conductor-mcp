@@ -146,6 +146,10 @@ async def get_task_log(job_id: str, task_id: str) -> str:
 
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=port)
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "sse":
+        import uvicorn
+        port = int(os.getenv("PORT", 8000))
+        uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=port)
+    else:
+        mcp.run()  # stdio — used by Claude Desktop and local agents
