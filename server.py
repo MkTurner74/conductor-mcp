@@ -21,8 +21,11 @@ async def list_instance_types() -> str:
     Returns machine names, CPU/GPU specs, and indicative cost tiers.
     Use this before submitting a job to pick the right instance_type.
     """
-    data = await conductor.list_instance_types()
-    return json.dumps(data, indent=2)
+    try:
+        data = await conductor.list_instance_types()
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 
 @mcp.tool()
