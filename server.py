@@ -153,6 +153,7 @@ if __name__ == "__main__":
     if transport == "sse":
         import uvicorn
         port = int(os.getenv("PORT", 8000))
-        uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=port)
+        # Use Streamable HTTP (POST /mcp) — the modern MCP transport expected by claude.ai.
+        uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=port)
     else:
         mcp.run()  # stdio — used by Claude Desktop and local agents
