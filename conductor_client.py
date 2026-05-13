@@ -17,7 +17,12 @@ from typing import Any, Optional
 import httpx
 
 CONDUCTOR_API_URL = os.getenv("CONDUCTOR_API_URL", "https://api.conductortech.com")
-CONDUCTOR_DASHBOARD_URL = os.getenv("CONDUCTOR_DASHBOARD_URL", "https://dashboard.conductortech.com")
+
+def _resolve_url(env_var: str, default: str) -> str:
+    val = os.getenv(env_var, "").strip() or default
+    return val if "://" in val else f"https://{val}"
+
+CONDUCTOR_DASHBOARD_URL = _resolve_url("CONDUCTOR_DASHBOARD_URL", "https://dashboard.conductortech.com")
 
 # Load key data from env var (JSON string) or file path
 def _load_key() -> dict:
@@ -45,6 +50,7 @@ _logger = logging.getLogger(__name__)
 _key_data = _load_key()
 if not _key_data.get("client_id"):
     _logger.error("CONDUCTOR_API_KEY not loaded — check env var format (must be valid JSON)")
+_logger.info(f"Conductor dashboard URL: {CONDUCTOR_DASHBOARD_URL}")
 _bearer_token: Optional[str] = None
 _token_expiry: float = 0
 
