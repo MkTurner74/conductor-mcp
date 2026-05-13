@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 import conductor_client as conductor
 
-mcp = FastMCP("Conductor")
+mcp = FastMCP("Conductor", host="0.0.0.0")
 
 
 @mcp.tool()
