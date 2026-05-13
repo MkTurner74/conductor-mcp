@@ -15,9 +15,9 @@ import time
 from typing import Any, Optional
 
 import httpx
-import jwt  # PyJWT
 
 CONDUCTOR_API_URL = os.getenv("CONDUCTOR_API_URL", "https://api.conductortech.com")
+CONDUCTOR_DASHBOARD_URL = os.getenv("CONDUCTOR_DASHBOARD_URL", "https://dashboard.conductortech.com")
 
 # Load key data from env var (JSON string) or file path
 def _load_key() -> dict:
@@ -48,22 +48,21 @@ async def _get_bearer_token() -> str:
     if not client_id or not private_key:
         raise RuntimeError("CONDUCTOR_API_KEY not set or missing client_id/private_key fields")
 
-    # Sign a short-lived JWT with the RSA private key
     now = int(time.time())
-    signed_jwt = jwt.encode(
-        {"iss": client_id, "sub": client_id, "aud": CONDUCTOR_API_URL, "iat": now, "exp": now + 3600},
-        private_key,
-        algorithm="RS256",
-    )
-
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(
-            f"{CONDUCTOR_API_URL}/api/v1/api_key/auth",
-            json={"token": signed_jwt},
+        resp = await client.get(
+            f"{CONDUCTOR_DASHBOARD_URL}/api/oauth_jwt",
+            params={
+                "grant_type": "client_credentials",
+                "scope": "owner admin user",
+                "client_id": client_id,
+                "client_secret": private_key,
+            },
         )
         resp.raise_for_status()
-        _bearer_token = resp.json()["token"]
-        _token_expiry = now + 3600
+        data = resp.json()
+        _bearer_token = data["access_token"]
+        _token_expiry = now + data.get("expires_in", 3600)
         return _bearer_token
 
 
@@ -71,7 +70,7 @@ async def _get(path: str, params: Optional[dict] = None) -> Any:
     token = await _get_bearer_token()
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
-            f"{CONDUCTOR_API_URL}{path}",
+            f"{CONDUCTOR_DASHBOARD_URL}{path}",
             headers={"Authorization": f"Bearer {token}"},
             params=params or {},
         )
@@ -83,7 +82,7 @@ async def _post(path: str, payload: dict) -> Any:
     token = await _get_bearer_token()
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"{CONDUCTOR_API_URL}{path}",
+            f"{CONDUCTOR_DASHBOARD_URL}{path}",
             headers={"Authorization": f"Bearer {token}"},
             json=payload,
         )
@@ -95,7 +94,7 @@ async def _put(path: str, payload: dict) -> Any:
     token = await _get_bearer_token()
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.put(
-            f"{CONDUCTOR_API_URL}{path}",
+            f"{CONDUCTOR_DASHBOARD_URL}{path}",
             headers={"Authorization": f"Bearer {token}"},
             json=payload,
         )
