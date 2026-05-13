@@ -31,9 +31,20 @@ def _load_key() -> dict:
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
+        pass
+    # Railway may inject actual newlines into the env var value — try stripping
+    # outer newlines (not the ones inside the private key value) and retry
+    try:
+        return json.loads(raw.strip())
+    except (json.JSONDecodeError, TypeError):
         return {}
 
+import logging
+_logger = logging.getLogger(__name__)
+
 _key_data = _load_key()
+if not _key_data.get("client_id"):
+    _logger.error("CONDUCTOR_API_KEY not loaded — check env var format (must be valid JSON)")
 _bearer_token: Optional[str] = None
 _token_expiry: float = 0
 
