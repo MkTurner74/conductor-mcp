@@ -15,6 +15,12 @@ mcp = FastMCP("Conductor", host="0.0.0.0")
 
 
 @mcp.tool()
+async def ping() -> str:
+    """Connectivity test — returns 'pong' if the server is reachable. No external calls."""
+    return "pong"
+
+
+@mcp.tool()
 async def list_instance_types() -> str:
     """
     List all available hardware instance types on Conductor.
