@@ -11,10 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 import conductor_client as conductor
 
-mcp = FastMCP(
-    "Conductor",
-    description="Submit and manage render jobs on Conductor by CoreWeave",
-)
+mcp = FastMCP("Conductor")
 
 
 @mcp.tool()
