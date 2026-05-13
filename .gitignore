@@ -1,4 +1,5 @@
 .env
+conductor_key.json
 __pycache__/
 *.pyc
 *.pyo
