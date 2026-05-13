@@ -15,35 +15,14 @@ mcp = FastMCP("Conductor", host="0.0.0.0", streamable_http_path="/")
 
 
 @mcp.tool()
-async def ping() -> str:
-    """Connectivity test — returns 'pong' if the server is reachable. No external calls."""
-    return "pong"
-
-
-@mcp.tool()
-async def debug_config() -> str:
-    """Show server configuration state — no sensitive values exposed."""
-    return json.dumps({
-        "dashboard_url": conductor.CONDUCTOR_DASHBOARD_URL,
-        "api_url": conductor.CONDUCTOR_API_URL,
-        "has_client_id": bool(conductor._key_data.get("client_id")),
-        "has_private_key": bool(conductor._key_data.get("private_key")),
-        "private_key_starts_with": (conductor._key_data.get("private_key", "")[:30] if conductor._key_data.get("private_key") else "MISSING"),
-    }, indent=2)
-
-
-@mcp.tool()
 async def list_instance_types() -> str:
     """
     List all available hardware instance types on Conductor.
     Returns machine names, CPU/GPU specs, and indicative cost tiers.
     Use this before submitting a job to pick the right instance_type.
     """
-    try:
-        data = await conductor.list_instance_types()
-        return json.dumps(data, indent=2)
-    except Exception as e:
-        return f"ERROR: {type(e).__name__}: {e}"
+    data = await conductor.list_instance_types()
+    return json.dumps(data, indent=2)
 
 
 @mcp.tool()
