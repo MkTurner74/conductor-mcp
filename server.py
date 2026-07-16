@@ -132,6 +132,26 @@ async def kill_jobs(job_ids: list[int], action: str = "kill") -> str:
 
 
 @mcp.tool()
+async def get_job_outputs(job_id: str, task_ids: list[str] = None) -> str:
+    """
+    List the rendered output files of a completed job, each with a signed
+    download URL valid for direct ingestion by another service — no local
+    download needed. Use after a job completes to hand outputs to a
+    transcode step, an upload, or a browser download.
+
+    Args:
+        job_id:   The Conductor job ID (from list_jobs or submit_render_job)
+        task_ids: Optional list of task IDs to restrict to (default: all tasks)
+
+    Returns {"job_id": ..., "downloads": [tasks]} where each task carries a
+    "files" list; every file has a signed "url" plus original path, size, and md5.
+    Signed URLs expire — fetch them again if a downstream step runs much later.
+    """
+    data = await conductor.get_job_outputs(job_id, task_ids)
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
 async def get_task_log(job_id: str, task_id: str) -> str:
     """
     Retrieve the log output for a specific task within a render job.

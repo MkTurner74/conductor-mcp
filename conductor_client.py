@@ -153,3 +153,39 @@ async def kill_jobs(job_ids: list[int], action: str = "kill") -> Any:
 
 async def get_task_log(job_id: str, task_id: str) -> Any:
     return await _get("/get_log_file", params={"job_id": job_id, "task_id": task_id})
+
+
+async def get_job_outputs(job_id: str, task_ids: Optional[list[str]] = None) -> Any:
+    """
+    List the output files of a job with signed download URLs.
+
+    Wraps POST /jobs/{job_id}/downloads (same endpoint ciocore's JobDownloader
+    uses). Response pages contain a "downloads" list of tasks, each with a
+    "files" list; every file dict carries a signed URL plus original path,
+    size, and md5. Follows next_cursor until all pages are collected.
+
+    Conductor job IDs are zero-padded to 5 digits in this endpoint's path.
+    task_ids of None means all tasks in the job.
+    """
+    token = await _get_bearer_token()
+    padded = str(job_id).zfill(5)
+    tasks: list = []
+    cursor: Optional[str] = None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            resp = await client.post(
+                f"{CONDUCTOR_DASHBOARD_URL}/jobs/{padded}/downloads",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"limit": 100, **({"start_cursor": cursor} if cursor else {})},
+                json={"tids": task_ids},
+            )
+            resp.raise_for_status()
+            # 204 = job exists but has no downloadable outputs (or none yet).
+            if resp.status_code == 204 or not resp.content:
+                break
+            page = resp.json()
+            tasks.extend(page.get("downloads", []))
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+    return {"job_id": padded, "downloads": tasks}
