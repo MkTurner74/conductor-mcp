@@ -6,8 +6,10 @@ Any MCP-compatible AI agent can submit and manage render jobs via this server.
 
 import json
 import os
+from typing import Annotated, Optional
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 import conductor_client as conductor
 
@@ -104,16 +106,16 @@ async def list_jobs(job_id_start: int = None, job_id_end: int = None) -> str:
 
 @mcp.tool()
 async def submit_render_job(
-    job_title: str,
-    project: str,
-    instance_type: str,
-    software_package_ids: list[str],
-    tasks: list[dict],
-    output_path: str,
-    priority: int = 5,
-    preemptible: bool = True,
-    notify: list[str] = None,
-    metadata: dict = None,
+    job_title: Annotated[str, Field(description="Display name shown in the Conductor dashboard")],
+    project: Annotated[str, Field(description="Conductor project to run under — pick from list_projects")],
+    instance_type: Annotated[str, Field(description="Machine type — pick from list_instance_types. All types run on CoreWeave cloud and any listed type is valid; GPU types name their GPU model")],
+    software_package_ids: Annotated[list[str], Field(description="Software package IDs to load on the render node — pick from list_software_packages")],
+    tasks: Annotated[list[dict], Field(description='Task list. Each task: {"command": "<render command>", "frames": "1-10"}')],
+    output_path: Annotated[str, Field(description="Directory the render command writes into. Conductor syncs it back to its storage; outputs are then retrievable as signed URLs via get_job_outputs")],
+    priority: Annotated[int, Field(description="1–10, higher runs sooner. Default 5")] = 5,
+    preemptible: Annotated[bool, Field(description="true = discounted spot capacity that can be interrupted and retried (fine for most renders); false = uninterrupted, costs more. Default true")] = True,
+    notify: Annotated[Optional[list[str]], Field(description="Email addresses to notify when the job finishes")] = None,
+    metadata: Annotated[Optional[dict], Field(description="Custom key-value tags for tracking/reporting")] = None,
 ) -> str:
     """
     Submit a render job to Conductor.
