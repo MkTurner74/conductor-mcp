@@ -11,7 +11,49 @@ from mcp.server.fastmcp import FastMCP
 
 import conductor_client as conductor
 
-mcp = FastMCP("Conductor", host="0.0.0.0", streamable_http_path="/")
+# Stateless mode (no in-memory MCP sessions) is required on serverless hosts
+# (Vercel) where each request may hit a fresh instance. Local uvicorn keeps
+# stateful sessions unless STATELESS_HTTP is set.
+_STATELESS = bool(os.getenv("STATELESS_HTTP") or os.getenv("VERCEL"))
+
+mcp = FastMCP("Conductor", host="0.0.0.0", streamable_http_path="/", stateless_http=_STATELESS)
+
+
+class BearerAuthMiddleware:
+    """Reject requests without the shared bearer token when MCP_AUTH_TOKEN is set.
+
+    The hosted instance fronts Mark's Conductor account (job submission spends
+    real money), so it must never run open on the public internet. Callers
+    (the Samsyn app's /api/conductor route, the navigator dev proxy) hold the
+    token server-side; it never reaches a browser.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and self.token:
+            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            if headers.get("authorization") != f"Bearer {self.token}":
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"application/json")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b'{"error": "unauthorized"}',
+                })
+                return
+        await self.app(scope, receive, send)
+
+
+def build_app():
+    """ASGI app with optional bearer auth — used by uvicorn and the Vercel entry."""
+    app = mcp.streamable_http_app()
+    token = os.getenv("MCP_AUTH_TOKEN", "").strip()
+    return BearerAuthMiddleware(app, token) if token else app
 
 
 @mcp.tool()
@@ -171,6 +213,6 @@ if __name__ == "__main__":
         import uvicorn
         port = int(os.getenv("PORT", 8000))
         # Use Streamable HTTP (POST /mcp) — the modern MCP transport expected by claude.ai.
-        uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=port)
+        uvicorn.run(build_app(), host="0.0.0.0", port=port)
     else:
         mcp.run()  # stdio — used by Claude Desktop and local agents
