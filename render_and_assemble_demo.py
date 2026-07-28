@@ -42,7 +42,7 @@ logger = logging.getLogger(f"{ciocore.loggeria.CONDUCTOR_LOGGER_NAME}.render_and
 
 # Demo-sized defaults — a real render costs money, so keep it small.
 OUTPUT_PATH = "/my_renders/samsyn_render_demo"
-PROJECT = "default"
+PROJECT = "TestProject"   # the one project on this account (list_projects); NOT "default"
 INSTANCE_TYPE = "cw-xeonv3-32"
 FRAME_START = 1
 FRAME_END = 24            # 1 second at 24fps — enough to prove motion, cheap
