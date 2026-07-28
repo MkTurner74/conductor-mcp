@@ -191,22 +191,23 @@ HOUDINI_SCRIPT = textwrap.dedent(
 # with no DCC package (e.g. a future Botverse-style encode-only job on
 # CoreWeave), you SIDE-LOAD a static ffmpeg at runtime — that pattern is the
 # SIDELOAD_FFMPEG_SNIPPET below, kept here on purpose per the off-AWS plan.
-# Wrapped in { ...; } so the whole thing is ONE compound command — that keeps
-# the `hython && { resolve; } && ffmpeg` chain intact (ffmpeg runs only if the
-# render succeeded AND ffmpeg was found). ASCII-only to avoid worker locale issues.
+# FFmpeg resolution on the worker. EMPIRICAL FINDING (job 00001, 2026-07-28):
+# Houdini 21 does NOT ship ffmpeg at $HFS/bin, and CoreWeave render nodes have
+# no system ffmpeg — so the assemble step MUST side-load a static build. We
+# still try $HFS/bin/ffmpeg and PATH first (cheap, no egress) and fall back to
+# the side-load. This side-load is exactly the pattern that would let Botverse
+# encode on CoreWeave (no DCC package to borrow ffmpeg from) — see the doc.
+# Wrapped in { ...; } so `hython && { resolve; } && ffmpeg` chains correctly.
+# NB: the side-load needs outbound egress from the node (johnvansickle static).
 FFMPEG_RESOLVE = (
     '{ FF="$HFS/bin/ffmpeg"; '
     '[ -x "$FF" ] || FF="$(command -v ffmpeg)"; '
-    '[ -x "$FF" ] || { echo "no ffmpeg on node - side-load required"; exit 3; }; }'
-)
-
-# Reusable side-load (NOT used in the demo command — documented + retained for
-# the Botverse-on-CoreWeave path, where there's no Houdini package to borrow
-# ffmpeg from). Fetches a static linux build at runtime; needs node egress.
-SIDELOAD_FFMPEG_SNIPPET = (
+    '[ -x "$FF" ] || { '
+    'echo "no ffmpeg on node - side-loading static build"; '
     'curl -Lso /tmp/ff.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz '
     '&& mkdir -p /tmp/ff && tar xJf /tmp/ff.tar.xz -C /tmp/ff --strip-components=1 '
-    '&& FF=/tmp/ff/ffmpeg'
+    '&& FF=/tmp/ff/ffmpeg; }; '
+    '[ -x "$FF" ] || { echo "ffmpeg unavailable (side-load failed - node egress?)"; exit 3; }; }'
 )
 
 
