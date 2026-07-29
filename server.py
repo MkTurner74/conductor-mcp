@@ -11,7 +11,10 @@ from typing import Annotated, Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+import asyncio
+
 import conductor_client as conductor
+import conductor_render
 
 # Stateless mode (no in-memory MCP sessions) is required on serverless hosts
 # (Vercel) where each request may hit a fresh instance. Local uvicorn keeps
@@ -157,6 +160,55 @@ async def submit_render_job(
         payload["metadata"] = metadata
 
     data = await conductor.submit_job(payload)
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+async def submit_houdini_render(
+    output_path: Annotated[str, Field(description="Directory the render writes PNG frames into (e.g. /my_renders/samsyn_render). Retrieve results via get_job_outputs")],
+    project: Annotated[str, Field(description="Conductor project (default TestProject) — see list_projects")] = "TestProject",
+    instance_type: Annotated[str, Field(description="CoreWeave machine type (default cw-xeonv3-32) — see list_instance_types")] = "cw-xeonv3-32",
+    frame_start: Annotated[int, Field(description="First frame (default 1)")] = 1,
+    frame_end: Annotated[int, Field(description="Last frame (default 24). Keep small — real GPU/CPU minutes cost money")] = 24,
+    res_x: Annotated[int, Field(description="Width in px (default 1280)")] = 1280,
+    res_y: Annotated[int, Field(description="Height in px (default 720)")] = 720,
+    preemptible: Annotated[bool, Field(description="Spot capacity (cheaper, retried). Default true")] = True,
+) -> str:
+    """
+    Submit a self-contained Houdini/Karma render to Conductor (CoreWeave) — no
+    file uploads. Builds a spinning 3D object scene at runtime and renders a PNG
+    frame sequence. Uses the ciocore SDK (the working submission path) and
+    auto-resolves the latest Houdini 21 package.
+
+    Renders FRAMES ONLY. To make a video, retrieve the frames with
+    get_job_outputs (signed URLs) and assemble them downstream (Botverse
+    assemble_sequence, or client-side) — CoreWeave render nodes have no ffmpeg
+    and no egress, so in-node assembly is not available.
+
+    Returns the job id (jid) + output path. Poll get_render_status(jid); when
+    done, call get_job_outputs(jid).
+    """
+    # ciocore Submit is synchronous — run off the event loop.
+    result = await asyncio.to_thread(
+        conductor_render.submit_houdini_render,
+        project=project, instance_type=instance_type, output_path=output_path,
+        frame_start=frame_start, frame_end=frame_end, res_x=res_x, res_y=res_y,
+        preemptible=preemptible,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_render_status(jid: str) -> str:
+    """
+    Status of a render job by its job id (jid, e.g. "00003" or "3").
+
+    Use this instead of list_jobs for a single job: the list_jobs job-id range
+    filter does not actually filter, so this matches by jid explicitly. Returns
+    status (pending/running/success/failed), per-state task counts, and title.
+    When status is success (or failed-with-frames), call get_job_outputs(jid).
+    """
+    data = await conductor_render.render_status(jid)
     return json.dumps(data, indent=2)
 
 
