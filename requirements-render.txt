@@ -1,8 +1,10 @@
-# Superset of requirements.txt for a persistent host (Railway) that also needs
-# to run submit_houdini_render. Deliberately kept separate from
-# requirements.txt: Vercel's lean serverless deployment installs from
-# requirements.txt only and must NOT gain ciocore (see conductor_render.py's
-# header comment) — this file exists so Railway can install everything in one
-# pip command without touching what Vercel builds.
+# Reference only — not read automatically by the Railway build (see
+# nixpacks.toml, which chains a `pip install ciocore` phase after Nixpacks'
+# own requirements.txt install instead). Useful if you're building this image
+# by hand: superset of requirements.txt with ciocore added, for a persistent
+# host that needs to run submit_houdini_render. Deliberately kept separate
+# from requirements.txt itself — Vercel's lean serverless deployment installs
+# from requirements.txt only and must NOT gain ciocore (see
+# conductor_render.py's header comment).
 -r requirements.txt
 ciocore==9.1.1

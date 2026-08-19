@@ -1,6 +1,15 @@
-# Overrides Nixpacks' auto-detected Python install step so this (Railway)
-# deployment gets ciocore too — Vercel is untouched, it builds from
-# requirements.txt directly via its own Python runtime, never reading this
-# file. See requirements-render.txt for why the two are kept separate.
-[phases.install]
-cmds = ["pip install -r requirements-render.txt"]
+# Adds ciocore on top of Nixpacks' own auto-detected requirements.txt install
+# for this (Railway) deployment — Vercel is untouched, it builds from
+# requirements.txt directly via its own Python runtime and never reads this
+# file.
+#
+# NB: an earlier version of this file overrode [phases.install] outright with
+# a custom `pip install` command. That skipped Nixpacks' own venv/PATH setup
+# (it normally emits a persistent ENV PATH pointing at the venv it creates for
+# the install phase), so the replacement command ran in a bare shell with no
+# `pip` on PATH at all (exit 127). Chaining a new phase via dependsOn instead
+# runs after Nixpacks' own working install, inheriting its already-configured
+# pip/PATH rather than replacing it.
+[phases.installCiocore]
+dependsOn = ["install"]
+cmds = ["pip install ciocore==9.1.1"]
