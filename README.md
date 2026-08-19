@@ -79,12 +79,22 @@ To connect to the hosted instance, replace `http://localhost:8000` with the prov
 
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app)
 
+Railway is a **persistent host**, unlike the lean Vercel deployment — it's the
+only target that can run `submit_houdini_render`, because that tool needs the
+`ciocore` SDK, which is deliberately excluded from `requirements.txt` (see
+`conductor_render.py`'s header comment) so Vercel's serverless build stays
+lean. `nixpacks.toml` in this repo overrides Railway's install step to use
+`requirements-render.txt` (requirements.txt + ciocore) instead — nothing to
+configure, it's automatic once you deploy from this repo.
+
 1. Fork this repo
 2. Create a new Railway project → **Deploy from GitHub repo**
 3. Set environment variables in Railway dashboard:
-   - `CONDUCTOR_API_KEY` — your API key value
+   - `CONDUCTOR_API_KEY` — the **full JSON** service-account credential from your Conductor profile (or set `CONDUCTOR_API_KEY_FILE` to a path if you upload the JSON as a file instead). This is Conductor's own credential, server-side only.
    - `CONDUCTOR_API_URL` — `https://api.conductortech.com` (default, usually no change needed)
+   - `MCP_AUTH_TOKEN` — a shared secret your MCP clients must send as `Authorization: Bearer <value>`. **Do not skip this** — job submission spends real money, so an MCP server without it is open to the internet. This is a *different* secret from the client-side value some setups also call `CONDUCTOR_API_KEY` (e.g. the navigator's `.env.local`) — that client-side value is this token, not Conductor's JSON credential. Keep the two straight when copying values between dashboards.
 4. Deploy — Railway assigns a public URL automatically
+5. Point every MCP client's `CONDUCTOR_MCP_URL` at that new Railway URL to get `submit_houdini_render` working; the Vercel instance still works fine for every other tool.
 
 ---
 
@@ -92,8 +102,9 @@ To connect to the hosted instance, replace `http://localhost:8000` with the prov
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `CONDUCTOR_API_KEY` | Yes | — | API key from your Conductor profile |
+| `CONDUCTOR_API_KEY` | Yes | — | Conductor's own JSON service-account credential (server-side auth *to* Conductor) |
 | `CONDUCTOR_API_URL` | No | `https://api.conductortech.com` | Conductor API base URL |
+| `MCP_AUTH_TOKEN` | Strongly recommended | — (open if unset) | Shared bearer secret MCP clients must send — a *different* secret from `CONDUCTOR_API_KEY` above, see the Railway section |
 | `PORT` | No | `8000` | Port to listen on (Railway sets this automatically) |
 
 ---

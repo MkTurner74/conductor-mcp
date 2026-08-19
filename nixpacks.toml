@@ -1,0 +1,6 @@
+# Overrides Nixpacks' auto-detected Python install step so this (Railway)
+# deployment gets ciocore too — Vercel is untouched, it builds from
+# requirements.txt directly via its own Python runtime, never reading this
+# file. See requirements-render.txt for why the two are kept separate.
+[phases.install]
+cmds = ["pip install -r requirements-render.txt"]
