@@ -660,6 +660,16 @@ async def submit_inference(dry_run: bool = True, **kwargs) -> dict:
 #
 # These strings must match the field ids created in the Portal admin UI exactly.
 # Change them here and in the UI together, or writes will silently drop fields.
+#
+# Reduced to the EIGHT fields that exist on the Portal (created 2026-08-27).
+# Dropped deliberately: created_by / created_at / generated_by / generated_at
+# (Cantemo stamps creating user and date natively), and lora_used (the
+# generated_with_lora relation edge says it better). The two job-id fields
+# collapsed into one aiprov_job_id.
+#
+# HARD REQUIREMENT, learned the hard way: a field must be ATTACHED TO THE GROUP,
+# not merely exist. Writing an orphan field id returns
+# 400 "Vidispine error: notFound metadata-field <id>".
 PROVENANCE_FIELD_IDS = {
     "provenance_kind": "aiprov_kind",
     "status": "aiprov_status",
@@ -667,14 +677,8 @@ PROVENANCE_FIELD_IDS = {
     "base_model": "aiprov_base_model",
     "trigger_word": "aiprov_trigger_word",
     "prompt": "aiprov_prompt",
-    "lora_used": "aiprov_lora_used",
     "source_asset_ids": "aiprov_source_assets",
-    "training_job_id": "aiprov_training_job",
-    "inference_job_id": "aiprov_inference_job",
-    "created_by": "aiprov_created_by",
-    "created_at": "aiprov_created_at",
-    "generated_by": "aiprov_generated_by",
-    "generated_at": "aiprov_generated_at",
+    "job_id": "aiprov_job_id",
 }
 
 
@@ -743,9 +747,7 @@ async def ingest_lora_to_cantemo(
                 "label": label,
                 "base_model": base_model,
                 "trigger_word": trigger_word,
-                "training_job_id": job_id,
-                "created_by": created_by,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "job_id": job_id,
                 "source_asset_ids": ",".join(source_item_ids),
             }
         ),
@@ -830,9 +832,7 @@ async def create_tracked_lora_item(
                 "label": label,
                 "base_model": base_model,
                 "trigger_word": trigger_word,
-                "training_job_id": job_id,
-                "created_by": created_by,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "job_id": job_id,
                 "source_asset_ids": ",".join(source_item_ids),
             }
         ),
@@ -945,11 +945,8 @@ async def ingest_generated_images(
                     "provenance_kind": "generated_image",
                     "prompt": prompt,
                     "base_model": base_model,
-                    "lora_used": lora_item_id,
-                    "inference_job_id": job_id,
-                    "generated_by": created_by,
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                }
+                        "job_id": job_id,
+                        }
             ),
             group_name=PROVENANCE_GROUP,
         )
