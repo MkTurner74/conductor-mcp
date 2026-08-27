@@ -87,18 +87,49 @@ async def wait_for(jid: str) -> dict:
     return await conductor_render.render_status(jid)
 
 
+async def job_ids(jid: str) -> dict:
+    """
+    Resolve a padded jid to Conductor's internal numeric ids.
+
+    The status call returns neither the task id nor anything that links to the
+    log, but the raw job record carries `id` and `task_keys`, and
+    /api/v1/tasks/{key} resolves from there. Used only to print useful links.
+    """
+    try:
+        jobs = await conductor.list_jobs()
+        data = jobs.get("data", jobs) if isinstance(jobs, dict) else jobs
+        job = next((j for j in data if str(j.get("jid")) == str(jid).zfill(5)), None)
+        if not job:
+            return {}
+        keys = job.get("task_keys") or []
+        return {"job_id": job.get("id"), "task_keys": keys, "output_path": job.get("output_path")}
+    except Exception as exc:
+        _log_err(f"could not resolve internal ids: {exc}")
+        return {}
+
+
+def _log_err(msg: str) -> None:
+    print(f"  ! {msg}")
+
+
 async def fetch_log(jid: str) -> str:
     """
-    Pull the task log. Conductor task ids are not returned by the status call,
-    so try the usual forms rather than guessing one and failing silently.
+    Try to pull the task log through the API.
+
+    Confirmed 2026-08-27 against job 00005: this does not currently work on this
+    account. /get_log_file answers 500 for every parameter shape tried --
+    task id "000" (the real tid, per /api/v1/tasks/{key}), the padded and
+    unpadded jid, and the internal numeric job/task ids. No log field appears on
+    the task or execution record either. The dashboard UI shows the log fine, so
+    read it there rather than trusting this path.
     """
-    for task_id in ("001", "1", "01", "000", "0"):
+    for task_id in ("000", "001", "1", "01", "0"):
         try:
             data = await conductor.get_task_log(jid, task_id)
         except Exception:
             continue
         text = data if isinstance(data, str) else json.dumps(data)
-        if text and text.strip() not in ("", "{}", "null", '""'):
+        if text and text.strip() not in ("", "{}", "null", '""') and not text.lstrip().startswith("<!DOCTYPE"):
             print(f"  (log retrieved as task {task_id})")
             return text
     return ""
@@ -107,8 +138,10 @@ async def fetch_log(jid: str) -> str:
 def report(log_text: str) -> None:
     """Print the sections the discovery command emitted, and what they settle."""
     if not log_text:
-        print("\nNo log came back through the API. Read it in the dashboard instead:")
-        print(f"  {DASHBOARD}/jobs")
+        print("\nNo log came back through the API -- expected, see fetch_log()'s note.")
+        print("Read it in the dashboard instead:")
+        print(f"  {DASHBOARD}/jobs   -> open the job -> the task -> Log")
+        print("\nCopy everything between ===ENV=== and ===DONE=== back to Claude.")
         return
 
     print("\n" + "=" * 72)
@@ -172,6 +205,10 @@ async def main() -> int:
     print("Waiting for the job to finish...")
     status = await wait_for(str(jid))
     print(f"\nFinal status: {status.get('status')}  ({status.get('status_description') or 'no description'})")
+
+    ids = await job_ids(str(jid))
+    if ids:
+        print(f"  internal job id: {ids.get('job_id')}  task_keys: {ids.get('task_keys')}")
 
     print("\nFetching task log...")
     report(await fetch_log(str(jid)))
