@@ -399,6 +399,64 @@ async def ingest_lora_to_mam(
 
 
 @mcp.tool()
+async def submit_lora_inference(
+    lora_item_id: Annotated[str, Field(description="Cantemo item id of the LoRA to generate with — the item created by ingest_lora_to_mam")],
+    prompt: Annotated[str, Field(description="What to generate. Include the LoRA's trigger word to invoke the trained concept")],
+    count: Annotated[int, Field(description="Images to generate. Default 4")] = 4,
+    steps: Annotated[int, Field(description="Sampling steps. Default 30")] = 30,
+    seed: Annotated[int, Field(description="Random seed for reproducibility. Default 42")] = 42,
+    model: Annotated[str, Field(description="Base model the LoRA was trained against. Default sdxl")] = "sdxl",
+    dry_run: Annotated[bool, Field(description="True (default) builds the job WITHOUT spending GPU money. Set false only on explicit instruction")] = True,
+) -> str:
+    """
+    Generate images from a LoRA held in the Cantemo MAM.
+
+    Fetches the LoRA's weights back out of the MAM, uploads them to a CoreWeave
+    GPU node, and runs generation against the base model already on that node.
+
+    DEFAULTS TO A DRY RUN — a real submission spends money.
+    """
+    if err := _cantemo_guard():
+        return err
+    workdir = os.path.join(
+        os.getenv("LORA_WORKDIR", os.path.join(os.path.expanduser("~"), ".conductor-lora")),
+        "infer", lora_item_id,
+    )
+    try:
+        result = await lora_pipeline.submit_inference(
+            dry_run=dry_run, lora_item_id=lora_item_id, prompt=prompt,
+            workdir=workdir, count=count, steps=steps, seed=seed, model=model,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+async def ingest_generated_to_mam(
+    job_id: Annotated[str, Field(description="Conductor job id of the finished inference job")],
+    lora_item_id: Annotated[str, Field(description="The LoRA item these were generated with")],
+    prompt: Annotated[str, Field(description="The prompt used — recorded on every generated item")],
+    base_model: Annotated[str, Field(description="Base model product")] = "sdxl1-kohya",
+    created_by: Annotated[str, Field(description="Who ran the generation")] = "NearlyMe",
+) -> str:
+    """
+    Land generated images back in the Cantemo MAM, each carrying its prompt and
+    a relation edge back to the LoRA that produced it — closing the round trip.
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        result = await lora_pipeline.ingest_generated_images(
+            job_id=job_id, lora_item_id=lora_item_id, prompt=prompt,
+            base_model=base_model, created_by=created_by,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
 async def cantemo_provenance_plan() -> str:
     """
     Check whether the "AI Provenance" metadata group exists on the Portal, and

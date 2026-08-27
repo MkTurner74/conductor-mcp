@@ -229,25 +229,70 @@ TRAIN_COMMAND_TEMPLATE = (
 )
 
 
-def build_discovery_job(project: str = DEFAULT_PROJECT) -> dict:
-    """
-    A deliberately tiny job whose only purpose is to tell us what is actually
-    inside the kohya package -- entry point names, python location, sd-scripts
-    layout. Runs on the cheapest CPU instance; no GPU, no model load.
+DISCOVERY_COMMAND = (
+    "bash -lc '"
+    "echo ===ENV===; env | sort; "
+    "echo ===KOHYA_BIN===; ls -la \"$KOHYA_PATH\" 2>&1 | head -60; "
+    "echo ===TRAIN_SCRIPTS===; "
+    "find /opt/kohya_* -maxdepth 6 -name \"*train_network*\" -o -maxdepth 6 -name \"accelerate\" "
+    "-o -maxdepth 6 -name \"python*\" 2>/dev/null | head -40; "
+    "echo ===PKG_TREE===; find /opt/kohya_* -maxdepth 4 -type d 2>/dev/null | head -60; "
+    "echo ===MODEL===; ls -la \"$MODEL_BASE_HOME\" 2>&1 | head -20; "
+    "echo ===UPLOAD_LOCATION===; "
+    "find / -name \"DISCOVERY_PROBE.txt\" -not -path \"/proc/*\" 2>/dev/null | head -5; "
+    "echo ===CWD===; pwd; ls -la .; "
+    "echo ===DONE==="
+    "'"
+)
 
-    Run this once before trusting TRAIN_COMMAND_TEMPLATE.
+
+async def build_discovery_job(
+    probe_file: str,
+    project: str = DEFAULT_PROJECT,
+    instance_type: str = "cw-xeonv3-4",
+) -> dict:
     """
+    A deliberately tiny job whose only purpose is to tell us two things we are
+    currently guessing at: what is actually inside the kohya package (entry
+    point names, python location, sd-scripts layout), and where an uploaded
+    file lands on the node.
+
+    `probe_file` is a small local file uploaded with the job purely so the
+    ===UPLOAD_LOCATION=== section can find it and reveal the path mapping --
+    which is the thing node_path() is currently assuming.
+
+    Cheapest CPU instance, no GPU, no model load. Packages are still mounted so
+    the environment variables resolve.
+    """
+    packages = await resolve_packages("sdxl")
     return {
         "job_title": "kohya package discovery (listing only)",
         "project": project,
-        "instance_type": "cw-xeonv3-4",
-        "command": (
-            'bash -lc "echo ---ENV---; env | sort; '
-            "echo ---KOHYA_BIN---; ls -la $KOHYA_PATH; "
-            "echo ---PKG_TREE---; find /opt/kohya_* -maxdepth 4 -type d; "
-            'echo ---MODEL---; ls -la $MODEL_BASE_HOME"'
-        ),
+        "instance_type": instance_type,
+        "software_package_ids": packages["package_ids"],
+        "upload_only": False,
+        "force": False,
+        "local_upload": True,
+        "preemptible": True,
+        "output_path": "/lora_discovery",
+        "environment": packages["environment"],
+        "upload_paths": [probe_file],
+        "scout_frames": "1",
+        "tasks_data": [{"command": DISCOVERY_COMMAND, "frames": "1"}],
     }
+
+
+async def submit_discovery(probe_file: str, dry_run: bool = True, **kwargs) -> dict:
+    """Submit the discovery job. Cheap, but still real money, so still opt-in."""
+    job_args = await build_discovery_job(probe_file, **kwargs)
+    if dry_run:
+        return {"dry_run": True, "job_args": job_args}
+    import ciocore.conductor_submit
+
+    result, code = await asyncio.to_thread(
+        lambda: ciocore.conductor_submit.Submit(job_args).main()
+    )
+    return {"dry_run": False, "jid": result.get("jid"), "code": code, "status": result.get("status")}
 
 
 async def build_training_job(
@@ -368,6 +413,149 @@ async def submit_training(dry_run: bool = True, **kwargs) -> dict:
         "output_path": built["output_path"],
         "staged_files": len(built["staged"]["files"]),
         "skipped": built["staged"]["skipped"],
+    }
+
+
+# --- inference ------------------------------------------------------------
+
+# Same caveat as TRAIN_COMMAND_TEMPLATE: this is the expected shape, not a
+# proven one. kohya's sd-scripts ships sdxl_gen_img.py alongside the trainer,
+# which is why inference can reuse exactly the same two packages -- no second
+# software stack, and the base model is again already on the node.
+INFER_COMMAND_TEMPLATE = (
+    "{kohya_bin}/python {kohya_bin}/sdxl_gen_img.py"
+    " --ckpt {model_home}"
+    " --network_module networks.lora"
+    " --network_weights {lora_path}"
+    " --outdir {output_path}"
+    ' --prompt "{prompt}"'
+    " --images_per_prompt {count}"
+    " --W {width} --H {height}"
+    " --steps {steps}"
+    " --seed {seed}"
+    " --xformers"
+)
+
+
+async def stage_lora_from_cantemo(lora_item_id: str, workdir: str) -> dict:
+    """
+    Pull a LoRA's .safetensors back out of the MAM so it can be uploaded to the
+    render node.
+
+    The round trip is deliberately symmetric: the LoRA lives in Cantemo as a
+    first-class asset, so running inference means fetching it from the MAM like
+    any other piece of media -- not reaching into Conductor's job outputs for a
+    second time.
+    """
+    os.makedirs(workdir, exist_ok=True)
+    formats = await cantemo.get_formats(lora_item_id)
+    shapes = (formats or {}).get("formats") or []
+    if not shapes:
+        raise RuntimeError(f"LoRA item {lora_item_id} has no downloadable shape")
+    original = next((s for s in shapes if s.get("name") == "original"), shapes[0])
+    dest = os.path.join(workdir, f"{lora_item_id}.safetensors")
+    got = await cantemo.download_to(lora_item_id, dest, shape_id=original.get("id"))
+    if not got:
+        raise RuntimeError(f"Could not download LoRA weights for {lora_item_id}")
+    return {"path": got, "shape_id": original.get("id")}
+
+
+async def build_inference_job(
+    lora_item_id: str,
+    prompt: str,
+    workdir: str,
+    model: str = "sdxl",
+    count: int = 4,
+    width: int = 1024,
+    height: int = 1024,
+    steps: int = 30,
+    seed: int = 42,
+    project: str = DEFAULT_PROJECT,
+    instance_type: str = DEFAULT_INSTANCE_TYPE,
+    preemptible: bool = True,
+    node_lora_path: Optional[str] = None,
+) -> dict:
+    """
+    Assemble a generation job that applies a MAM-held LoRA to its base model.
+
+    preemptible defaults True here, unlike training: inference is short and
+    cheap to retry, so spot capacity is the sensible default.
+    """
+    if not prompt.strip():
+        raise ValueError("A prompt is required")
+
+    packages = await resolve_packages(model)
+    staged = await stage_lora_from_cantemo(lora_item_id, workdir)
+
+    env = dict(packages["environment"])
+    kohya_bin = env.get("KOHYA_PATH", "")
+    model_home = env.get("MODEL_BASE_HOME") or env.get("MODEL_HOME", "")
+    output_path = f"/lora_inference/{lora_item_id}"
+
+    # Quotes in a prompt would break out of the shell command; strip rather than
+    # attempt to escape, since a demo prompt never needs them.
+    safe_prompt = prompt.replace('"', "").replace("'", "").replace("\n", " ").strip()
+
+    command = INFER_COMMAND_TEMPLATE.format(
+        kohya_bin=kohya_bin,
+        model_home=model_home,
+        lora_path=node_lora_path or node_path(staged["path"]),
+        output_path=output_path,
+        prompt=safe_prompt,
+        count=count,
+        width=width,
+        height=height,
+        steps=steps,
+        seed=seed,
+    )
+
+    job_args = {
+        "job_title": f"LoRA generate -- {safe_prompt[:50]}",
+        "project": project,
+        "instance_type": instance_type,
+        "software_package_ids": packages["package_ids"],
+        "upload_only": False,
+        "force": False,
+        "local_upload": True,
+        "preemptible": preemptible,
+        "autoretry_policy": {"preempted": {"max_retries": 1}},
+        "output_path": output_path,
+        "environment": env,
+        "upload_paths": [staged["path"]],
+        "scout_frames": "1",
+        "tasks_data": [{"command": command, "frames": "1"}],
+        "metadata": {
+            "lora_item_id": lora_item_id,
+            "prompt": safe_prompt,
+            "base_model": packages["model_product"],
+        },
+    }
+    return {"job_args": job_args, "staged": staged, "output_path": output_path, "prompt": safe_prompt}
+
+
+async def submit_inference(dry_run: bool = True, **kwargs) -> dict:
+    """Build and (optionally) submit a generation job. Opt-in to spending, as ever."""
+    built = await build_inference_job(**kwargs)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "job_args": built["job_args"],
+            "output_path": built["output_path"],
+            "prompt": built["prompt"],
+        }
+
+    import ciocore.conductor_submit
+
+    result, code = await asyncio.to_thread(
+        lambda: ciocore.conductor_submit.Submit(built["job_args"]).main()
+    )
+    return {
+        "dry_run": False,
+        "jid": result.get("jid"),
+        "code": code,
+        "status": result.get("status"),
+        "output_path": built["output_path"],
+        "prompt": built["prompt"],
     }
 
 
