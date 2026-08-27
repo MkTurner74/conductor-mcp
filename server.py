@@ -13,8 +13,10 @@ from pydantic import Field
 
 import asyncio
 
+import cantemo_client as cantemo
 import conductor_client as conductor
 import conductor_render
+import lora_pipeline
 
 # Stateless mode (no in-memory MCP sessions) is required on serverless hosts
 # (Vercel) where each request may hit a fresh instance. Local uvicorn keeps
@@ -259,6 +261,170 @@ async def get_task_log(job_id: str, task_id: str) -> str:
     """
     data = await conductor.get_task_log(job_id, task_id)
     return json.dumps(data, indent=2) if isinstance(data, dict) else str(data)
+
+
+# --- Cantemo MAM <-> LoRA round trip -------------------------------------
+#
+# The CoreWeave IBC demo. These sit alongside the render tools rather than in
+# their own server because they are the same plumbing: Conductor jobs, submitted
+# and polled the same way. Only the job type is new.
+#
+# Every tool here degrades to a clear message when Cantemo is not configured,
+# so the render half of the server still works without MAM credentials.
+
+
+def _cantemo_guard() -> Optional[str]:
+    if not cantemo.configured():
+        return json.dumps({"error": "Cantemo not configured — set CANTEMO_URL and CANTEMO_API_TOKEN"})
+    return None
+
+
+@mcp.tool()
+async def cantemo_search_assets(
+    query: Annotated[str, Field(description="Free-text search. Empty string matches everything")] = "",
+    media_type: Annotated[Optional[str], Field(description="Filter to one media type: image, video, audio")] = None,
+    limit: Annotated[int, Field(description="Max results. Default 25")] = 25,
+) -> str:
+    """
+    Search assets in the Cantemo Portal MAM.
+
+    Use this to find the items to train a LoRA on. Returns item ids (VX-NNNN),
+    titles and media types — the ids are what submit_lora_training expects.
+    """
+    if err := _cantemo_guard():
+        return err
+    terms = [{"name": "mediaType", "value": media_type}] if media_type else None
+    data = await cantemo.search(
+        query=query, fields=["id", "title", "mediaType", "originalFilename"], terms=terms, limit=limit
+    )
+    results = [
+        {
+            "id": r.get("id"),
+            "title": (r.get("title") or [None])[0],
+            "mediaType": (r.get("mediaType") or [None])[0],
+        }
+        for r in (data or {}).get("results", [])
+    ]
+    return json.dumps({"hits": (data or {}).get("hits"), "results": results}, indent=2)
+
+
+@mcp.tool()
+async def cantemo_get_asset(
+    item_id: Annotated[str, Field(description="Cantemo item id, e.g. VX-4153")],
+) -> str:
+    """Full detail for one Cantemo item, including its shapes and provenance relations."""
+    if err := _cantemo_guard():
+        return err
+    item, formats, relations = await asyncio.gather(
+        cantemo.get_item(item_id),
+        cantemo.get_formats(item_id),
+        cantemo.get_relations(item_id),
+        return_exceptions=True,
+    )
+    def safe(v):
+        return {"error": str(v)} if isinstance(v, Exception) else v
+    return json.dumps({"item": safe(item), "formats": safe(formats), "relations": safe(relations)}, indent=2, default=str)
+
+
+@mcp.tool()
+async def submit_lora_training(
+    item_ids: Annotated[list[str], Field(description="Cantemo item ids to train on — get these from cantemo_search_assets")],
+    label: Annotated[str, Field(description='Human-readable name, e.g. "Aston Martin F1 — Livery v1"')],
+    trigger_word: Annotated[str, Field(description="Token that invokes the trained concept in prompts. Default 'sks'")] = "sks",
+    class_word: Annotated[str, Field(description="What kind of thing this is: style, livery, character, object")] = "style",
+    model: Annotated[str, Field(description="Base model: sdxl, flux-schnell, flux-dev, sd35-large, sd35-medium, sd3-medium")] = "sdxl",
+    epochs: Annotated[int, Field(description="Training epochs. Default 10")] = 10,
+    dry_run: Annotated[bool, Field(description="True (default) builds and validates the job WITHOUT spending GPU money. Set false only on explicit instruction")] = True,
+) -> str:
+    """
+    Train a LoRA on CoreWeave GPUs from assets selected in the Cantemo MAM.
+
+    Downloads the chosen images, lays them out as a kohya dataset, and submits a
+    training job to Conductor using the kohya package whose base model already
+    lives on the node (no egress needed).
+
+    DEFAULTS TO A DRY RUN. A real submission spends money on Mark's Conductor
+    account — only pass dry_run=false when explicitly told to.
+
+    Non-image items in the selection are skipped and reported, not fatal.
+    """
+    if err := _cantemo_guard():
+        return err
+    workdir = os.path.join(
+        os.getenv("LORA_WORKDIR", os.path.join(os.path.expanduser("~"), ".conductor-lora")),
+        "".join(ch if ch.isalnum() else "-" for ch in label).strip("-").lower(),
+    )
+    try:
+        result = await lora_pipeline.submit_training(
+            dry_run=dry_run,
+            item_ids=item_ids,
+            label=label,
+            workdir=workdir,
+            model=model,
+            trigger_word=trigger_word,
+            class_word=class_word,
+            epochs=epochs,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+async def ingest_lora_to_mam(
+    job_id: Annotated[str, Field(description="Conductor job id of the finished training job")],
+    label: Annotated[str, Field(description="Name for the LoRA item in the MAM")],
+    source_item_ids: Annotated[list[str], Field(description="The Cantemo items it was trained on — recorded as provenance relations")],
+    trigger_word: Annotated[str, Field(description="The trigger token used during training")] = "sks",
+    base_model: Annotated[str, Field(description="Base model product it was trained against")] = "sdxl1-kohya",
+    created_by: Annotated[str, Field(description="Who ran the training")] = "NearlyMe",
+) -> str:
+    """
+    Land a finished LoRA back in the Cantemo MAM with full provenance.
+
+    Creates a new item, imports the .safetensors from Conductor's signed output
+    URL, writes the provenance metadata, and creates a relation edge to every
+    source asset so the MAM itself can answer "what was this trained on".
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        result = await lora_pipeline.ingest_lora_to_cantemo(
+            job_id=job_id, label=label, source_item_ids=source_item_ids,
+            base_model=base_model, trigger_word=trigger_word, created_by=created_by,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+async def cantemo_provenance_plan() -> str:
+    """
+    Check whether the "AI Provenance" metadata group exists on the Portal, and
+    report the fields the round trip needs.
+
+    Field creation is not exposed on Cantemo's v2 API — it goes through the
+    Portal admin UI or Vidispine — so this reports the plan rather than applying it.
+    """
+    if err := _cantemo_guard():
+        return err
+    return json.dumps(await lora_pipeline.bootstrap_provenance_group(), indent=2, default=str)
+
+
+@mcp.tool()
+async def kohya_package_info(
+    model: Annotated[str, Field(description="Base model key: sdxl, flux-schnell, flux-dev, sd35-large, sd35-medium, sd3-medium")] = "sdxl",
+) -> str:
+    """
+    Show which Conductor packages a LoRA job would load and where the base model
+    sits on the node. Read-only — useful for confirming the training environment
+    before spending anything.
+    """
+    try:
+        return json.dumps(await lora_pipeline.resolve_packages(model), indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
 
 
 if __name__ == "__main__":
