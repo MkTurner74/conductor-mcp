@@ -561,16 +561,50 @@ async def submit_inference(dry_run: bool = True, **kwargs) -> dict:
 
 # --- write-back -----------------------------------------------------------
 
+# Logical name -> Cantemo field id.
+#
+# Cantemo enforces a field-id format of {custom-name}_{field-name}, each part
+# starting with a letter, so a bare "label" or "prompt" is rejected outright.
+# Prefixing every id with aiprov_ satisfies that and makes collisions with the
+# Portal's existing fields impossible -- these are global, not group-scoped.
+#
+# These strings must match the field ids created in the Portal admin UI exactly.
+# Change them here and in the UI together, or writes will silently drop fields.
+PROVENANCE_FIELD_IDS = {
+    "provenance_kind": "aiprov_kind",
+    "label": "aiprov_label",
+    "base_model": "aiprov_base_model",
+    "trigger_word": "aiprov_trigger_word",
+    "prompt": "aiprov_prompt",
+    "lora_used": "aiprov_lora_used",
+    "source_asset_ids": "aiprov_source_assets",
+    "training_job_id": "aiprov_training_job",
+    "inference_job_id": "aiprov_inference_job",
+    "created_by": "aiprov_created_by",
+    "created_at": "aiprov_created_at",
+    "generated_by": "aiprov_generated_by",
+    "generated_at": "aiprov_generated_at",
+}
+
+
 def _provenance_fields(values: dict) -> list[dict]:
     """
-    Flatten a provenance dict into Cantemo metadata fields.
+    Flatten a provenance dict into Cantemo metadata fields, translating our
+    logical names into the Portal's field ids.
 
-    Field names here are logical, not Portal internal ids (portal_mfNNNNNN).
-    They only resolve once the "AI Provenance" metadata group exists on the
-    Portal -- see bootstrap_provenance_group(), which is not yet automated
-    because field creation is not exposed on the v2 API surface.
+    An unmapped key would be written under a name the Portal does not know and
+    silently discarded, so it raises instead -- a provenance record that loses
+    fields without saying so is worse than one that fails loudly.
     """
-    return [{"name": k, "value": str(v)} for k, v in values.items() if v is not None]
+    out = []
+    for key, value in values.items():
+        if value is None:
+            continue
+        field_id = PROVENANCE_FIELD_IDS.get(key)
+        if not field_id:
+            raise KeyError(f"No Cantemo field id mapped for provenance key {key!r}")
+        out.append({"name": field_id, "value": str(value)})
+    return out
 
 
 async def ingest_lora_to_cantemo(
@@ -720,23 +754,28 @@ async def bootstrap_provenance_group() -> dict:
     """
     existing = await cantemo.list_metadata_groups(limit=200)
     names = {g.get("name") for g in (existing or {}).get("results", [])}
+
+    # Report which of our fields actually landed, so a half-finished UI session
+    # is visible rather than showing up later as quietly missing metadata.
+    present: set[str] = set()
+    if PROVENANCE_GROUP in names:
+        try:
+            group = await cantemo.get_metadata_group(PROVENANCE_GROUP)
+            present = {f.get("name") for f in (group or {}).get("fields", [])}
+        except Exception as exc:
+            _logger.error("[lora] could not read group %s: %s", PROVENANCE_GROUP, exc)
+
     return {
         "group": PROVENANCE_GROUP,
         "exists": PROVENANCE_GROUP in names,
         "create_via": "Portal admin UI (/vs/metadatamanagement/) or Vidispine metadata-field API",
+        "missing": sorted(set(PROVENANCE_FIELD_IDS.values()) - present),
+        "present": sorted(set(PROVENANCE_FIELD_IDS.values()) & present),
+        # Every field is Text except the prompt, which is a Textarea. The code
+        # writes strings throughout, so a Date/Timestamp/Multi-Choice field
+        # would reject the value it is handed.
         "fields": [
-            {"name": "provenance_kind", "type": "dropdown", "choices": ["lora", "generated_image"]},
-            {"name": "label", "type": "string"},
-            {"name": "base_model", "type": "string"},
-            {"name": "trigger_word", "type": "string"},
-            {"name": "prompt", "type": "textarea"},
-            {"name": "lora_used", "type": "string"},
-            {"name": "source_asset_ids", "type": "tags"},
-            {"name": "training_job_id", "type": "string"},
-            {"name": "inference_job_id", "type": "string"},
-            {"name": "created_by", "type": "string"},
-            {"name": "created_at", "type": "timestamp"},
-            {"name": "generated_by", "type": "string"},
-            {"name": "generated_at", "type": "timestamp"},
+            {"id": field_id, "ui_type": "Textarea" if field_id == "aiprov_prompt" else "Text"}
+            for field_id in PROVENANCE_FIELD_IDS.values()
         ],
     }
