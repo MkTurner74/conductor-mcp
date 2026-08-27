@@ -24,12 +24,18 @@ Two findings shape this module, both worth knowing before changing it:
 
 Everything that spends GPU money defaults to dry_run=True. Callers opt in.
 
-**Unverified, deliberately:** the exact kohya entry point inside the package.
-KOHYA_PATH points at a bin directory but its contents have not been listed --
-that needs one cheap discovery job on Conductor (see build_discovery_job), or a
-usage note from CoreWeave. TRAIN_COMMAND_TEMPLATE below is the shape we expect,
-not a shape we have run. Do not present it as proven until the discovery job
-has confirmed the binary names.
+**Settled by discovery job 00005 (2026-08-27):**
+  * $KOHYA_PATH is the sd-scripts repo root. sdxl_train_network.py and
+    sdxl_gen_img.py both exist there; `accelerate` and `python` do not, and the
+    node PATH does not include them either -- hence sourcing $ENV_FILE.
+  * The upload path mapping is exactly the drive-strip rule node_path()
+    assumed: C:\\Users\\... arrives as /Users/... on the node.
+  * $MODEL_BASE_HOME holds both the diffusers tree and the 6.9 GB
+    sd_xl_base_1.0.safetensors, so kohya can be pointed straight at it.
+
+**Still unverified:** whether `python` (or `accelerate`) is on PATH once
+$ENV_FILE is sourced. DEFAULT_LAUNCHER assumes plain `python`. Run the env probe
+(run_discovery.py --probe-env) before the first paid training run.
 """
 
 import asyncio
@@ -69,6 +75,17 @@ REL_TRAINED_FROM = "lora_trained_from"
 REL_GENERATED_WITH = "generated_with_lora"
 
 PROVENANCE_GROUP = "AI Provenance"
+
+# Job states as they appear on the Cantemo item, so the whole round trip can be
+# watched from the MAM without anyone opening Conductor's dashboard.
+STATUS_SUBMITTED = "submitted"
+STATUS_RUNNING = "training"
+STATUS_GENERATING = "generating"
+STATUS_READY = "ready"
+STATUS_FAILED = "failed"
+
+# Conductor job states that mean "stop polling".
+TERMINAL_STATES = {"success", "failed", "killed", "complete", "completed"}
 
 
 # --- Conductor package resolution ----------------------------------------
@@ -198,11 +215,14 @@ def node_path(local_path: str) -> str:
     how it was caught here, by dry-running the built command rather than reading
     it back from the code.
 
-    UNCONFIRMED against a real run: the drive-strip rule is Conductor's
-    documented behaviour but this account has only ever submitted jobs with an
-    empty upload_paths (the Houdini proof job built its scene inline). The
-    discovery job should confirm where uploads actually land before the first
-    paid training run. Override with the node_dataset_dir argument if it differs.
+    CONFIRMED by discovery job 00005 (2026-08-27): a probe file uploaded from
+    C:\\Users\\mktur\\AppData\\Local\\Temp\\conductor-lora-discovery\\ was found
+    on the node at /Users/mktur/AppData/Local/Temp/conductor-lora-discovery/ --
+    exactly this rule. Conductor does the mapping through its own path helper
+    (CONDUCTOR_PATHHELPER=1, LD_PRELOAD=cio_path_helper.so,
+    __conductor_letter_drives__=1 in the node environment).
+
+    Override with the node_dataset_dir argument if a future case differs.
     """
     p = local_path.replace("\\", "/")
     if len(p) > 1 and p[1] == ":":  # drive-lettered Windows path
@@ -211,10 +231,28 @@ def node_path(local_path: str) -> str:
 
 
 
-# Shape we expect, NOT a shape we have run -- see the module docstring.
+# Corrected against the real package listing from discovery job 00005
+# (2026-08-27). What that run established:
+#
+#   * $KOHYA_PATH is the kohya_ss/sd-scripts REPO ROOT, not a bin directory of
+#     executables. sdxl_train_network.py, sdxl_gen_img.py, train_network.py and
+#     the networks/ package all sit directly in it.
+#   * There is NO `accelerate` and NO `python` executable inside it, and the
+#     node's PATH is only /usr/local/bin:/usr/bin:/bin:... -- so the original
+#     "{kohya_bin}/accelerate launch" was wrong twice over.
+#   * The package ships $ENV_FILE (/opt/kohya_2025.07.16/pkg_env.sh), which is
+#     how a Spack-style layout like this puts its interpreter and PYTHONPATH on
+#     PATH. Every command therefore sources it first.
+#
+# LAUNCHER stays configurable because whether `accelerate` exists after sourcing
+# pkg_env.sh is still unconfirmed -- run the env probe to settle it. Plain
+# `python` is the safe default: kohya's Accelerator falls back to single-process
+# when not launched under accelerate, which is what a single-GPU job wants.
+DEFAULT_LAUNCHER = "python"
+
 TRAIN_COMMAND_TEMPLATE = (
-    "{kohya_bin}/accelerate launch {kohya_bin}/sdxl_train_network.py"
-    " --pretrained_model_name_or_path={model_home}"
+    'bash -lc \'source "$ENV_FILE" && {launcher} "$KOHYA_PATH/sdxl_train_network.py"'
+    ' --pretrained_model_name_or_path="$MODEL_BASE_HOME"'
     " --train_data_dir={dataset_dir}"
     " --output_dir={output_path}"
     " --output_name={output_name}"
@@ -225,7 +263,24 @@ TRAIN_COMMAND_TEMPLATE = (
     " --resolution={resolution}"
     " --save_model_as=safetensors"
     " --mixed_precision=bf16"
-    " --cache_latents"
+    " --cache_latents'"
+)
+
+# Probes what the package environment actually provides once sourced -- the one
+# thing discovery 00005 could not answer, because it never sourced $ENV_FILE.
+ENV_PROBE_COMMAND = (
+    "bash -lc '"
+    "echo ===BEFORE===; echo PATH=$PATH; "
+    'source "$ENV_FILE"; '
+    "echo ===AFTER===; echo PATH=$PATH; "
+    "echo ===WHICH===; "
+    "for b in python python3 accelerate torchrun; do "
+    'printf "%s -> " "$b"; command -v "$b" || echo MISSING; done; '
+    "echo ===VERSION===; python -V 2>&1 || python3 -V 2>&1; "
+    "echo ===TORCH===; "
+    "python -c \"import torch,sys;print(torch.__version__, torch.cuda.is_available())\" 2>&1 | head -3; "
+    "echo ===ENVFILE===; head -40 \"$ENV_FILE\"; "
+    "echo ===DONE==='"
 )
 
 
@@ -282,6 +337,47 @@ async def build_discovery_job(
     }
 
 
+async def build_env_probe_job(
+    project: str = DEFAULT_PROJECT,
+    instance_type: str = "cw-xeonv3-4",
+) -> dict:
+    """
+    Second, smaller discovery: source $ENV_FILE and report what lands on PATH.
+
+    Discovery 00005 listed the package but never sourced its environment file,
+    so it could not say how to invoke python. This settles DEFAULT_LAUNCHER.
+    """
+    packages = await resolve_packages("sdxl")
+    return {
+        "job_title": "kohya env probe (source pkg_env.sh)",
+        "project": project,
+        "instance_type": instance_type,
+        "software_package_ids": packages["package_ids"],
+        "upload_only": False,
+        "force": False,
+        "local_upload": True,
+        "preemptible": True,
+        "output_path": "/lora_discovery",
+        "environment": packages["environment"],
+        "upload_paths": [],
+        "scout_frames": "1",
+        "tasks_data": [{"command": ENV_PROBE_COMMAND, "frames": "1"}],
+    }
+
+
+async def submit_env_probe(dry_run: bool = True, **kwargs) -> dict:
+    """Submit the env probe. Cheap, CPU-only, but still real money."""
+    job_args = await build_env_probe_job(**kwargs)
+    if dry_run:
+        return {"dry_run": True, "job_args": job_args}
+    import ciocore.conductor_submit
+
+    result, code = await asyncio.to_thread(
+        lambda: ciocore.conductor_submit.Submit(job_args).main()
+    )
+    return {"dry_run": False, "jid": result.get("jid"), "code": code, "status": result.get("status")}
+
+
 async def submit_discovery(probe_file: str, dry_run: bool = True, **kwargs) -> dict:
     """Submit the discovery job. Cheap, but still real money, so still opt-in."""
     job_args = await build_discovery_job(probe_file, **kwargs)
@@ -311,6 +407,7 @@ async def build_training_job(
     repeats: int = 10,
     preemptible: bool = False,
     node_dataset_dir: Optional[str] = None,
+    launcher: str = DEFAULT_LAUNCHER,
 ) -> dict:
     """
     Assemble everything Conductor needs for one LoRA training job.
@@ -339,16 +436,12 @@ async def build_training_job(
     slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in label).strip("-").lower()
     output_path = f"/lora_training/{slug}"
     env = dict(packages["environment"])
-    kohya_bin = env.get("KOHYA_PATH", "")
-    model_home = env.get("MODEL_BASE_HOME") or env.get("MODEL_HOME", "")
-
     # The training command runs on a Linux node, so it must NOT be handed the
     # local staging path -- see node_path().
     node_dataset_dir = node_dataset_dir or node_path(staged["dataset_dir"])
 
     command = TRAIN_COMMAND_TEMPLATE.format(
-        kohya_bin=kohya_bin,
-        model_home=model_home,
+        launcher=launcher,
         dataset_dir=node_dataset_dir,
         output_path=output_path,
         output_name=slug,
@@ -423,8 +516,8 @@ async def submit_training(dry_run: bool = True, **kwargs) -> dict:
 # which is why inference can reuse exactly the same two packages -- no second
 # software stack, and the base model is again already on the node.
 INFER_COMMAND_TEMPLATE = (
-    "{kohya_bin}/python {kohya_bin}/sdxl_gen_img.py"
-    " --ckpt {model_home}"
+    'bash -lc \'source "$ENV_FILE" && {launcher} "$KOHYA_PATH/sdxl_gen_img.py"'
+    ' --ckpt "$MODEL_BASE_HOME"'
     " --network_module networks.lora"
     " --network_weights {lora_path}"
     " --outdir {output_path}"
@@ -432,8 +525,7 @@ INFER_COMMAND_TEMPLATE = (
     " --images_per_prompt {count}"
     " --W {width} --H {height}"
     " --steps {steps}"
-    " --seed {seed}"
-    " --xformers"
+    " --seed {seed}'"
 )
 
 
@@ -474,6 +566,7 @@ async def build_inference_job(
     instance_type: str = DEFAULT_INSTANCE_TYPE,
     preemptible: bool = True,
     node_lora_path: Optional[str] = None,
+    launcher: str = DEFAULT_LAUNCHER,
 ) -> dict:
     """
     Assemble a generation job that applies a MAM-held LoRA to its base model.
@@ -488,8 +581,6 @@ async def build_inference_job(
     staged = await stage_lora_from_cantemo(lora_item_id, workdir)
 
     env = dict(packages["environment"])
-    kohya_bin = env.get("KOHYA_PATH", "")
-    model_home = env.get("MODEL_BASE_HOME") or env.get("MODEL_HOME", "")
     output_path = f"/lora_inference/{lora_item_id}"
 
     # Quotes in a prompt would break out of the shell command; strip rather than
@@ -497,8 +588,7 @@ async def build_inference_job(
     safe_prompt = prompt.replace('"', "").replace("'", "").replace("\n", " ").strip()
 
     command = INFER_COMMAND_TEMPLATE.format(
-        kohya_bin=kohya_bin,
-        model_home=model_home,
+        launcher=launcher,
         lora_path=node_lora_path or node_path(staged["path"]),
         output_path=output_path,
         prompt=safe_prompt,
@@ -572,6 +662,7 @@ async def submit_inference(dry_run: bool = True, **kwargs) -> dict:
 # Change them here and in the UI together, or writes will silently drop fields.
 PROVENANCE_FIELD_IDS = {
     "provenance_kind": "aiprov_kind",
+    "status": "aiprov_status",
     "label": "aiprov_label",
     "base_model": "aiprov_base_model",
     "trigger_word": "aiprov_trigger_word",
@@ -679,6 +770,141 @@ async def ingest_lora_to_cantemo(
         "related": linked,
         "relation_failures": failed,
     }
+
+
+async def job_status(job_id: str) -> dict:
+    """
+    Conductor's view of a job, reduced to what the MAM needs to show.
+
+    list_jobs' id-range filter does not actually filter (it returns job 1
+    regardless), so match on the padded jid instead.
+    """
+    jobs = await conductor.list_jobs()
+    data = jobs.get("data", jobs) if isinstance(jobs, dict) else jobs
+    want = str(job_id).zfill(5)
+    for job in (data if isinstance(data, list) else [data]):
+        if str(job.get("jid")) == want:
+            return {
+                "jid": want,
+                "status": job.get("status"),
+                "running": job.get("running"),
+                "success": job.get("success"),
+                "failed": job.get("failed"),
+                "pending": job.get("pending"),
+                "terminal": str(job.get("status") or "").lower() in TERMINAL_STATES,
+            }
+    return {"jid": want, "status": "not_found", "terminal": False}
+
+
+async def create_tracked_lora_item(
+    label: str,
+    job_id: str,
+    source_item_ids: list[str],
+    base_model: str,
+    trigger_word: str,
+    created_by: str,
+) -> dict:
+    """
+    Create the LoRA's MAM item the moment training is submitted, not when it
+    finishes.
+
+    This is what keeps the demo inside Cantemo. The item exists immediately with
+    status "submitted" and relation edges to every training asset, so the whole
+    story -- what is being trained, from what, by whom, and how far along it is
+    -- is visible in the MAM while the GPU work happens. Nobody needs to open
+    Conductor's dashboard to see whether it worked.
+
+    The media arrives later, via finalize_tracked_lora().
+    """
+    item = await cantemo.create_placeholder(title=f"LoRA -- {label}")
+    item_id = item.get("id") or item.get("item_id") or (item.get("object") or {}).get("id")
+    if not item_id:
+        return {"ok": False, "error": "Could not read new item id", "response": item}
+
+    await cantemo.set_metadata(
+        item_id,
+        _provenance_fields(
+            {
+                "provenance_kind": "lora",
+                "status": STATUS_SUBMITTED,
+                "label": label,
+                "base_model": base_model,
+                "trigger_word": trigger_word,
+                "training_job_id": job_id,
+                "created_by": created_by,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_asset_ids": ",".join(source_item_ids),
+            }
+        ),
+        group_name=PROVENANCE_GROUP,
+    )
+
+    linked, failed = [], []
+    for src in source_item_ids:
+        try:
+            await cantemo.create_relation(item_id, src, relation_type=REL_TRAINED_FROM)
+            linked.append(src)
+        except Exception as exc:
+            failed.append({"item_id": src, "error": str(exc)})
+
+    return {"ok": True, "item_id": item_id, "job_id": job_id, "related": linked, "relation_failures": failed}
+
+
+async def sync_status_to_mam(item_id: str, job_id: str, kind: str = "lora") -> dict:
+    """
+    Copy Conductor's job state onto the MAM item once.
+
+    Call it on a timer (or from a rules-engine action) and the item's status
+    field tracks the job. Deliberately one shot rather than a loop, so the
+    caller decides the cadence and nothing blocks.
+    """
+    status = await job_status(job_id)
+    raw = str(status.get("status") or "").lower()
+    if raw in ("success", "complete", "completed"):
+        mapped = STATUS_READY
+    elif raw in ("failed", "killed"):
+        mapped = STATUS_FAILED
+    elif raw in ("running",):
+        mapped = STATUS_GENERATING if kind == "generated_image" else STATUS_RUNNING
+    else:
+        mapped = STATUS_SUBMITTED
+
+    await cantemo.set_metadata(
+        item_id, _provenance_fields({"status": mapped}), group_name=PROVENANCE_GROUP
+    )
+    return {"item_id": item_id, "conductor_status": status.get("status"), "mam_status": mapped,
+            "terminal": status.get("terminal")}
+
+
+async def finalize_tracked_lora(item_id: str, job_id: str) -> dict:
+    """
+    Attach the trained weights to the item that has been tracking the job.
+
+    Separate from create_tracked_lora_item so the item can exist (and be watched)
+    for the whole training run, with the media arriving at the end.
+    """
+    outputs = await conductor.get_job_outputs(job_id)
+    weights = [
+        f
+        for task in outputs.get("downloads", [])
+        for f in task.get("files", [])
+        if str(f.get("name") or f.get("path") or "").endswith(".safetensors")
+    ]
+    if not weights:
+        await cantemo.set_metadata(
+            item_id, _provenance_fields({"status": STATUS_FAILED}), group_name=PROVENANCE_GROUP
+        )
+        return {"ok": False, "error": f"No .safetensors in outputs of job {job_id}"}
+
+    url = weights[0].get("url") or weights[0].get("signed_url")
+    if not url:
+        return {"ok": False, "error": "Output file carried no signed URL"}
+
+    await cantemo.import_uri(item_id, url, notranscode=True)
+    await cantemo.set_metadata(
+        item_id, _provenance_fields({"status": STATUS_READY}), group_name=PROVENANCE_GROUP
+    )
+    return {"ok": True, "item_id": item_id, "weights_file": weights[0].get("name") or weights[0].get("path")}
 
 
 async def ingest_generated_images(

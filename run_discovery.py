@@ -174,11 +174,25 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Run the Conductor kohya discovery job")
     parser.add_argument("--dry-run", action="store_true", help="build and print the job, submit nothing")
     parser.add_argument("--job", help="skip submission; fetch results for this existing job id")
+    parser.add_argument("--probe-env", action="store_true",
+                        help="run the env probe instead: source pkg_env.sh and report what lands on PATH")
     args = parser.parse_args()
 
     if args.job:
         jid = args.job
         print(f"Fetching results for existing job {jid}")
+    elif args.probe_env:
+        print("Building env probe job (sources $ENV_FILE on the node)...")
+        result = await lp.submit_env_probe(dry_run=args.dry_run)
+        if args.dry_run:
+            print("\nDRY RUN -- nothing submitted.\n")
+            print(result["job_args"]["tasks_data"][0]["command"])
+            return 0
+        jid = result.get("jid")
+        if not jid:
+            print(json.dumps(result, indent=2, default=str))
+            return 1
+        print(f"\nSubmitted. Job {jid}\n")
     else:
         probe = make_probe()
         print(f"Probe file: {probe}")
