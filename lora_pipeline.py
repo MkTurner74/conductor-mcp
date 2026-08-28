@@ -33,9 +33,17 @@ Everything that spends GPU money defaults to dry_run=True. Callers opt in.
   * $MODEL_BASE_HOME holds both the diffusers tree and the 6.9 GB
     sd_xl_base_1.0.safetensors, so kohya can be pointed straight at it.
 
-**Still unverified:** whether `python` (or `accelerate`) is on PATH once
-$ENV_FILE is sourced. DEFAULT_LAUNCHER assumes plain `python`. Run the env probe
-(run_discovery.py --probe-env) before the first paid training run.
+**Settled by env probe job 00010 (2026-08-28):** sourcing $ENV_FILE works
+(rc=0) and puts 214 entries on PATH, including:
+  * `python` / `python3` -> the package's own venv, **Python 3.11.9**
+  * `accelerate` -> py-accelerate 0.33.0
+  * `torchrun` -> py-torch 2.5.1
+So DEFAULT_LAUNCHER = "python" is correct and present. `accelerate launch` is
+also available if multi-GPU is ever wanted -- left unused because it can prompt
+for a config on first run, and kohya's Accelerator falls back to single-process
+under plain python anyway.
+
+Nothing about the node environment is guessed at any more.
 """
 
 import asyncio
@@ -298,7 +306,7 @@ ENV_PROBE_COMMAND = (
     '( . "$ENV_FILE" >/dev/null 2>&1; echo "source_rc=$?"; echo "PATH_AFTER=$PATH"; '
     "for b in python python3 accelerate torchrun pip; do "
     'printf "%s -> " "$b"; command -v "$b" || echo MISSING; done; '
-    'python -V 2>&1; python -c "import torch;print(\\"torch\\", torch.__version__)" 2>&1 ); '
+    "python -V 2>&1; python -c 'import torch; print(torch.__version__, torch.cuda.is_available())' 2>&1 ); "
     'echo ===KOHYA_BIN===; ls -la "$KOHYA_PATH"; '
     "echo ===DONE===; "
     "} > /lora_discovery/probe.txt 2>&1; exit 0'"
