@@ -258,8 +258,26 @@ def node_path(local_path: str) -> str:
 # when not launched under accelerate, which is what a single-GPU job wants.
 DEFAULT_LAUNCHER = "python"
 
+#
+# Two things this template learned from training job 00011, which failed after
+# ~2.5 minutes on the node with no outputs at all:
+#
+# 1. **cd into $KOHYA_PATH first.** `--network_module=networks.lora` is a Python
+#    module living inside the sd-scripts repo. Invoking the script by absolute
+#    path from /tmp leaves `networks` unimportable — the single most likely
+#    reason 00011 died early.
+# 2. **Capture the log to output_path and always exit 0.** Conductor's task-log
+#    API is broken on this account AND a failed job syncs no outputs, so a
+#    failure is invisible twice over. Writing train.log next to the weights, and
+#    exiting 0 so the sync happens, makes the next failure self-diagnosing. The
+#    real exit code goes to train_status.txt — SUCCESS is therefore judged by
+#    "did a .safetensors appear", which is what the ingest step already checks.
 TRAIN_COMMAND_TEMPLATE = (
-    'bash -lc \'source "$ENV_FILE" && {launcher} "$KOHYA_PATH/sdxl_train_network.py"'
+    "bash -c '"
+    "set +e; mkdir -p {output_path}; "
+    'source "$ENV_FILE"; '
+    'cd "$KOHYA_PATH" || exit 0; '
+    "{{ {launcher} sdxl_train_network.py"
     ' --pretrained_model_name_or_path="$MODEL_BASE_HOME"'
     " --train_data_dir={dataset_dir}"
     " --output_dir={output_path}"
@@ -271,7 +289,11 @@ TRAIN_COMMAND_TEMPLATE = (
     " --resolution={resolution}"
     " --save_model_as=safetensors"
     " --mixed_precision=bf16"
-    " --cache_latents'"
+    " --cache_latents; "
+    "echo train_rc=$? > {output_path}/train_status.txt; "
+    "}} > {output_path}/train.log 2>&1; "
+    "ls -la {output_path} >> {output_path}/train.log 2>&1; "
+    "exit 0'"
 )
 
 # Probes what the package environment actually provides once sourced -- the one
@@ -544,17 +566,26 @@ async def submit_training(dry_run: bool = True, **kwargs) -> dict:
 # proven one. kohya's sd-scripts ships sdxl_gen_img.py alongside the trainer,
 # which is why inference can reuse exactly the same two packages -- no second
 # software stack, and the base model is again already on the node.
+# Same shape as training, and for the same two reasons — sdxl_gen_img.py also
+# imports networks.lora, and a failed generation is just as invisible.
 INFER_COMMAND_TEMPLATE = (
-    'bash -lc \'source "$ENV_FILE" && {launcher} "$KOHYA_PATH/sdxl_gen_img.py"'
+    "bash -c '"
+    "set +e; mkdir -p {output_path}; "
+    'source "$ENV_FILE"; '
+    'cd "$KOHYA_PATH" || exit 0; '
+    "{{ {launcher} sdxl_gen_img.py"
     ' --ckpt "$MODEL_BASE_HOME"'
     " --network_module networks.lora"
     " --network_weights {lora_path}"
     " --outdir {output_path}"
-    ' --prompt "{prompt}"'
+    ' --prompt \\"{prompt}\\"'
     " --images_per_prompt {count}"
     " --W {width} --H {height}"
     " --steps {steps}"
-    " --seed {seed}'"
+    " --seed {seed}; "
+    "echo infer_rc=$? > {output_path}/infer_status.txt; "
+    "}} > {output_path}/infer.log 2>&1; "
+    "exit 0'"
 )
 
 
