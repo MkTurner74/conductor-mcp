@@ -181,6 +181,25 @@ async def add_to_collection(collection_id: str, item_ids: list[str]) -> Optional
     return (data or {}).get("task")
 
 
+async def remove_from_collection(collection_id: str, item_ids: list[str]) -> Any:
+    """
+    Take items back out of a collection, leaving the items themselves alone.
+
+    Matters because the collection IS the training set: a LoRA trained on a
+    folder holding two unrelated subjects learns a muddle of both. Curating the
+    folder has to be as easy as filling it.
+
+    Same repeated-`selected_objects` convention as add_to_collection, and the
+    same background execution.
+    """
+    if not item_ids:
+        return None
+    qs = "&".join(f"selected_objects={quote(i)}" for i in item_ids)
+    return await _request(
+        "DELETE", f"/API/v2/collections/{quote(collection_id)}/content/item/?{qs}"
+    )
+
+
 async def get_item(item_id: str) -> dict:
     return await _request("GET", f"/API/v2/items/{quote(item_id)}/")
 

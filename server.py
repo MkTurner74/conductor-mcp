@@ -389,6 +389,62 @@ async def cantemo_add_to_collection(
 
 
 @mcp.tool()
+async def cantemo_stamp_training_sources(
+    source_item_ids: Annotated[list[str], Field(description="The Cantemo items that were trained on")],
+    label: Annotated[str, Field(description="Name of the LoRA they produced")],
+    job_id: Annotated[str, Field(description="Conductor training job id")],
+    base_model: Annotated[str, Field(description="Base model product")] = "sdxl1-kohya",
+    trigger_word: Annotated[str, Field(description="Trigger token the LoRA was trained with")] = "",
+) -> str:
+    """
+    Write provenance onto the training images themselves.
+
+    Without this, a source still shows "There is no metadata for this item yet"
+    in the MAM even though it helped train a model. Provenance should read both
+    ways: the LoRA says what it came from, and each contributing image says what
+    it went into.
+
+    Uses the same eight fields with prov_kind = training_source.
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        result = await lora_pipeline.stamp_source_assets(
+            source_item_ids=source_item_ids, label=label, job_id=job_id,
+            base_model=base_model, trigger_word=trigger_word,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+async def cantemo_remove_from_collection(
+    collection_name: Annotated[str, Field(description='Collection to remove from, e.g. "Train LoRA"')],
+    item_ids: Annotated[list[str], Field(description="Cantemo item ids to remove")],
+) -> str:
+    """
+    Take items out of a collection without deleting the items.
+
+    The collection IS the training set, so curating it matters: a LoRA trained
+    on a folder holding two unrelated subjects learns a muddle of both.
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        coll_id = await cantemo.find_collection(collection_name)
+        if not coll_id:
+            return json.dumps({"error": f'No collection named "{collection_name}"'}, indent=2)
+        await cantemo.remove_from_collection(coll_id, item_ids)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(
+        {"ok": True, "collection": collection_name, "collection_id": coll_id,
+         "removed": len(item_ids), "items": item_ids}, indent=2,
+    )
+
+
+@mcp.tool()
 async def cantemo_get_asset(
     item_id: Annotated[str, Field(description="Cantemo item id, e.g. VX-4153")],
 ) -> str:

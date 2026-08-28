@@ -828,7 +828,7 @@ async def ingest_lora_to_cantemo(
         f
         for task in outputs.get("downloads", [])
         for f in task.get("files", [])
-        if str(f.get("name") or f.get("path") or "").endswith(".safetensors")
+        if output_name(f).endswith(".safetensors")
     ]
     if not weights:
         return {"ok": False, "error": f"No .safetensors in outputs of job {job_id}", "outputs": outputs}
@@ -873,10 +873,23 @@ async def ingest_lora_to_cantemo(
         "ok": True,
         "item_id": item_id,
         "job_id": job_id,
-        "weights_file": weight.get("name") or weight.get("path"),
+        "weights_file": output_name(weight),
         "related": linked,
         "relation_failures": failed,
     }
+
+
+def output_name(f: dict) -> str:
+    """
+    The filename of a Conductor output.
+
+    Conductor calls this field **relative_path** — there is no `name` and no
+    `path`. Filtering on those (as this module first did) silently matches
+    nothing, so a job that produced a perfectly good .safetensors reports "no
+    weights found". Cost a confused round trip on job 00013; keep all the
+    candidates here so it cannot happen again.
+    """
+    return str(f.get("relative_path") or f.get("name") or f.get("output_path") or f.get("path") or "")
 
 
 async def job_status(job_id: str) -> dict:
@@ -993,7 +1006,7 @@ async def finalize_tracked_lora(item_id: str, job_id: str) -> dict:
         f
         for task in outputs.get("downloads", [])
         for f in task.get("files", [])
-        if str(f.get("name") or f.get("path") or "").endswith(".safetensors")
+        if output_name(f).endswith(".safetensors")
     ]
     if not weights:
         await cantemo.set_metadata(
@@ -1009,7 +1022,57 @@ async def finalize_tracked_lora(item_id: str, job_id: str) -> dict:
     await cantemo.set_metadata(
         item_id, _provenance_fields({"status": STATUS_READY}), group_name=PROVENANCE_GROUP
     )
-    return {"ok": True, "item_id": item_id, "weights_file": weights[0].get("name") or weights[0].get("path")}
+    return {"ok": True, "item_id": item_id, "weights_file": output_name(weights[0])}
+
+
+async def stamp_source_assets(
+    source_item_ids: list[str],
+    label: str,
+    job_id: str,
+    base_model: str,
+    trigger_word: str,
+) -> dict:
+    """
+    Write provenance onto the TRAINING IMAGES themselves.
+
+    Until this ran, a source still carried nothing: open one in the MAM and it
+    said "There is no metadata for this item yet", even though it had helped
+    train a model. The relation edge existed, but an operator looking at the
+    asset saw an unexplained picture.
+
+    Provenance should read in both directions. The LoRA says what it came from;
+    each contributing image should say what it went into.
+
+    No new fields are needed -- the same eight carry a third kind alongside
+    "lora" and "generated_image":
+        prov_kind = training_source, and prov_label / prov_job_id /
+        prov_base_model / prov_trigger_word name the model it fed.
+    prompt and source_assets stay empty; neither means anything on an original.
+
+    NB this writes to assets we did not create. It is additive and reversible,
+    but on someone else's Portal that is worth doing deliberately.
+    """
+    stamped, failed = [], []
+    for item_id in source_item_ids:
+        try:
+            await cantemo.set_metadata(
+                item_id,
+                _provenance_fields(
+                    {
+                        "provenance_kind": "training_source",
+                        "status": STATUS_READY,
+                        "label": label,
+                        "base_model": base_model,
+                        "trigger_word": trigger_word,
+                        "job_id": job_id,
+                    }
+                ),
+                group_name=PROVENANCE_GROUP,
+            )
+            stamped.append(item_id)
+        except Exception as exc:
+            failed.append({"item_id": item_id, "error": f"{type(exc).__name__}: {exc}"})
+    return {"ok": not failed, "stamped": stamped, "failures": failed, "count": len(stamped)}
 
 
 async def ingest_generated_images(
@@ -1028,7 +1091,7 @@ async def ingest_generated_images(
         f
         for task in outputs.get("downloads", [])
         for f in task.get("files", [])
-        if str(f.get("name") or f.get("path") or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+        if output_name(f).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     ]
     if not images:
         return {"ok": False, "error": f"No images in outputs of job {job_id}"}
