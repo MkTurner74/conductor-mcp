@@ -198,11 +198,28 @@ async def stage_training_images(
                 continue
             ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime, ".png")
             dest = os.path.join(subdir, f"{item_id}{ext}")
-            got = await cantemo.download_to(item_id, dest, shape_id=original.get("id"))
+
+            # Retry: job 00012 trained on 5 images instead of 8 because three
+            # downloads hit transient connection failures and were silently
+            # recorded as skipped. A flaky link should not quietly shrink the
+            # training set — that changes the result without anyone noticing.
+            got = None
+            last_err: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    got = await cantemo.download_to(item_id, dest, shape_id=original.get("id"))
+                    if got:
+                        break
+                except Exception as exc:
+                    last_err = exc
+                    _logger.warning("[lora] %s download attempt %d failed: %s", item_id, attempt + 1, exc)
+                await asyncio.sleep(2 * (attempt + 1))
+
             if got:
                 files.append(got)
             else:
-                skipped.append({"item_id": item_id, "reason": "download failed"})
+                reason = f"download failed after 3 tries ({type(last_err).__name__})" if last_err else "download failed"
+                skipped.append({"item_id": item_id, "reason": reason})
         except Exception as exc:  # one bad asset must not sink the batch
             skipped.append({"item_id": item_id, "reason": f"{type(exc).__name__}: {exc}"})
 
@@ -289,7 +306,23 @@ TRAIN_COMMAND_TEMPLATE = (
     " --resolution={resolution}"
     " --save_model_as=safetensors"
     " --mixed_precision=bf16"
-    " --cache_latents; "
+    " --cache_latents"
+    # ---- VRAM, learned from job 00012 ----
+    # 00012 got into the training loop and then died with CUDA OOM: 23.59 of
+    # 23.68 GiB in use on the A5000. The traceback named the cause — it was in
+    # sdxl_original_unet._attention doing a full `attention_scores.softmax`,
+    # i.e. the naive attention path, because no memory-efficient backend was
+    # requested. Three flags fix it, cheapest first:
+    #   --sdpa                    torch 2.5's built-in memory-efficient
+    #                             attention. No xformers package needed, and
+    #                             this alone removes the quadratic buffer.
+    #   --gradient_checkpointing  trades compute for activation memory.
+    #   --network_train_unet_only skips the two text encoders entirely — a
+    #                             large saving, and irrelevant to a livery/style
+    #                             LoRA, which learns appearance not vocabulary.
+    " --sdpa"
+    " --gradient_checkpointing"
+    " --network_train_unet_only; "
     "echo train_rc=$? > {output_path}/train_status.txt; "
     "}} > {output_path}/train.log 2>&1; "
     "ls -la {output_path} >> {output_path}/train.log 2>&1; "
@@ -490,6 +523,10 @@ async def build_training_job(
     # The training command runs on a Linux node, so it must NOT be handed the
     # local staging path -- see node_path().
     node_dataset_dir = node_dataset_dir or node_path(staged["dataset_dir"])
+
+    # The OOM in job 00012 recommended this itself; it costs nothing and reduces
+    # allocator fragmentation, which is what turns a near-miss into a failure.
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     command = TRAIN_COMMAND_TEMPLATE.format(
         launcher=launcher,
