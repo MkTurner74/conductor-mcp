@@ -346,6 +346,49 @@ async def cantemo_collection_items(
 
 
 @mcp.tool()
+async def cantemo_add_to_collection(
+    collection_name: Annotated[str, Field(description='Collection to file the items into, e.g. "LoRA Output". Created if absent')],
+    item_ids: Annotated[list[str], Field(description="Cantemo item ids to add")],
+) -> str:
+    """
+    File items into a named Cantemo collection, creating it if it does not exist.
+
+    Used as the closing step of a generation run so the new images land somewhere
+    a person actually looks, rather than only existing as loose items. Adds
+    without moving, so an item stays in any collection it is already in.
+    """
+    if err := _cantemo_guard():
+        return err
+    if not item_ids:
+        return json.dumps({"error": "No item_ids to add"}, indent=2)
+    try:
+        coll_id = await cantemo.find_collection(collection_name)
+        created = False
+        if not coll_id:
+            coll_id = await cantemo.create_collection(collection_name)
+            created = True
+        if not coll_id:
+            return json.dumps({"error": f'Could not find or create "{collection_name}"'}, indent=2)
+        task = await cantemo.add_to_collection(coll_id, item_ids)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(
+        {
+            "ok": True,
+            "collection": collection_name,
+            "collection_id": coll_id,
+            "created_collection": created,
+            "added": len(item_ids),
+            "items": item_ids,
+            # Cantemo performs the add in the background, so the collection may
+            # read empty for a few seconds afterwards.
+            "task": task,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 async def cantemo_get_asset(
     item_id: Annotated[str, Field(description="Cantemo item id, e.g. VX-4153")],
 ) -> str:
