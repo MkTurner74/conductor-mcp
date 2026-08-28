@@ -670,15 +670,23 @@ async def submit_inference(dry_run: bool = True, **kwargs) -> dict:
 # HARD REQUIREMENT, learned the hard way: a field must be ATTACHED TO THE GROUP,
 # not merely exist. Writing an orphan field id returns
 # 400 "Vidispine error: notFound metadata-field <id>".
+#
+# VERIFIED 2026-08-28: all eight write and read back on a scratch item, 8/8.
+#
+# Note prompt -> prov_prompt2, not prov_prompt. The id was taken during an
+# earlier attempt, so the field that actually made it into the group carries the
+# 2. Renaming it in the Portal would mean another pass through the group
+# builder for no functional gain; the mapping layer exists precisely so an
+# awkward external id stays external.
 PROVENANCE_FIELD_IDS = {
-    "provenance_kind": "aiprov_kind",
-    "status": "aiprov_status",
-    "label": "aiprov_label",
-    "base_model": "aiprov_base_model",
-    "trigger_word": "aiprov_trigger_word",
-    "prompt": "aiprov_prompt",
-    "source_asset_ids": "aiprov_source_assets",
-    "job_id": "aiprov_job_id",
+    "provenance_kind": "prov_kind",
+    "status": "prov_status",
+    "label": "prov_label",
+    "base_model": "prov_base_model",
+    "trigger_word": "prov_trigger_word",
+    "prompt": "prov_prompt2",
+    "source_asset_ids": "prov_source_assets",
+    "job_id": "prov_job_id",
 }
 
 
