@@ -143,6 +143,44 @@ async def collection_items(collection_id: str, media_type: Optional[str] = None)
     return items
 
 
+async def create_collection(name: str, parent_id: Optional[str] = None) -> Optional[str]:
+    """
+    Create a collection. The field is `collection_name`, not `name` -- passing
+    `name` returns a bare 500 with no hint.
+    """
+    body: dict = {"collection_name": name}
+    if parent_id:
+        body["parent_collection_id"] = parent_id
+    data = await _request("POST", "/API/v2/collections/?refresh=true", json=body)
+    return (data or {}).get("id")
+
+
+async def add_to_collection(collection_id: str, item_ids: list[str]) -> Optional[str]:
+    """
+    Add existing items to a collection without moving them.
+
+    Two things about this endpoint cost time:
+      * `selected_objects` must be REPEATED, one per id
+        (?selected_objects=VX-1&selected_objects=VX-2). Comma-separating them
+        returns 200 with a task id and then silently adds nothing.
+      * The BODY names the target collection ([{"id": "VX-2601"}]); the query
+        string names the assets. That is the opposite way round from what the
+        parameter names suggest.
+    Use this rather than PUT /content/, which MOVES items out of their current
+    collection -- destructive on someone else's system.
+
+    The work happens in the background, so a read straight afterwards may still
+    show the collection empty. Returns the task id.
+    """
+    if not item_ids:
+        return None
+    qs = "&".join(f"selected_objects={quote(i)}" for i in item_ids)
+    data = await _request(
+        "POST", f"/API/v2/collections/content/?{qs}", json=[{"id": collection_id}]
+    )
+    return (data or {}).get("task")
+
+
 async def get_item(item_id: str) -> dict:
     return await _request("GET", f"/API/v2/items/{quote(item_id)}/")
 
