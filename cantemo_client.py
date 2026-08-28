@@ -101,6 +101,48 @@ async def search(
     return await _request("PUT", f"/API/v2/search/?limit={int(limit)}", json=body)
 
 
+async def find_collection(name: str) -> Optional[str]:
+    """
+    Resolve a collection's display name to its id.
+
+    Autocomplete answers {"items": [{"VX-2556": "Clips"}]}, so the id is the key
+    and the name is the value. Matched case-insensitively and exactly, because
+    autocomplete is a prefix search and "Train" would otherwise pick up
+    "Training Archive".
+    """
+    data = await _request("GET", f"/API/v2/collections/autocomplete/?query={quote(name)}")
+    for entry in (data or {}).get("items", []):
+        for coll_id, coll_name in entry.items():
+            if str(coll_name).strip().lower() == name.strip().lower():
+                return coll_id
+    return None
+
+
+async def collection_items(collection_id: str, media_type: Optional[str] = None) -> list[dict]:
+    """
+    Every item in a collection, optionally filtered to one media type.
+
+    This is what lets the round trip be STARTED from the MAM without a Cantemo
+    plugin: a user curates a collection the way they would for any other purpose,
+    and the workflow reads it. No custom UI, no webhook -- neither of which
+    Cantemo offers us.
+    """
+    data = await _request("GET", f"/API/v2/collections/{quote(collection_id)}/content/item/")
+    items = []
+    for obj in (data or {}).get("objects", []):
+        kind = obj.get("mediaType")
+        kind = kind[0] if isinstance(kind, list) and kind else kind
+        if media_type and kind != media_type:
+            continue
+        title = obj.get("title")
+        items.append({
+            "id": obj.get("id"),
+            "title": title[0] if isinstance(title, list) and title else title,
+            "mediaType": kind,
+        })
+    return items
+
+
 async def get_item(item_id: str) -> dict:
     return await _request("GET", f"/API/v2/items/{quote(item_id)}/")
 

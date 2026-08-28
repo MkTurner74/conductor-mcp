@@ -309,6 +309,43 @@ async def cantemo_search_assets(
 
 
 @mcp.tool()
+async def cantemo_collection_items(
+    collection_name: Annotated[str, Field(description='Name of the Cantemo collection to read, e.g. "Train LoRA"')],
+    media_type: Annotated[Optional[str], Field(description="Filter to one media type: image, video, audio. Default image")] = "image",
+) -> str:
+    """
+    List the items a user has curated into a named Cantemo collection.
+
+    This is how the round trip gets STARTED from the MAM. Cantemo offers no
+    webhook and no way to add a button without a plugin Codemill would have to
+    install, so instead of pushing, we read: someone drags the assets they want
+    trained into a collection, and the workflow picks them up from there. An
+    ordinary MAM gesture, no custom UI.
+
+    Returns {items: [...]} — the ids feed straight into submit_lora_training.
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        coll_id = await cantemo.find_collection(collection_name)
+        if not coll_id:
+            return json.dumps({"error": f'No collection named "{collection_name}"'}, indent=2)
+        found = await cantemo.collection_items(coll_id, media_type=media_type or None)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps(
+        {
+            "collection": collection_name,
+            "collection_id": coll_id,
+            "count": len(found),
+            "items": [f["id"] for f in found],
+            "detail": found,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 async def cantemo_get_asset(
     item_id: Annotated[str, Field(description="Cantemo item id, e.g. VX-4153")],
 ) -> str:
