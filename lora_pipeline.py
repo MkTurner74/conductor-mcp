@@ -268,19 +268,40 @@ TRAIN_COMMAND_TEMPLATE = (
 
 # Probes what the package environment actually provides once sourced -- the one
 # thing discovery 00005 could not answer, because it never sourced $ENV_FILE.
+#
+# Job 00008 (the first attempt) FAILED on the node. A probe whose whole purpose
+# is to report what is missing must never fail because something is missing:
+# `set +e` so a absent binary doesn't abort, no `-l` (a login shell sources
+# profile scripts that can exit non-zero), `source` guarded, and an explicit
+# `exit 0` so Conductor always sees success and keeps the log.
+#
+# Writes its findings to a FILE in output_path rather than to stdout.
+#
+# Conductor's task-log API is broken on this account (/get_log_file 500s for
+# every parameter shape), so a probe that only prints needs a human in the
+# dashboard for every iteration -- which is exactly what made jobs 00008 and
+# 00009 expensive to diagnose. Output files, by contrast, come back through
+# get_job_outputs as signed URLs we can fetch directly. Same trick works for
+# any future on-node debugging.
+#
+# Structural care, learned from those two failures: no login shell (profile
+# scripts can exit non-zero), the source runs in a SUBSHELL so an `exit` inside
+# pkg_env.sh cannot kill the probe, no `..` in paths (the node's LD_PRELOAD path
+# helper flags traversal), no piping into `head` (SIGPIPE), and an explicit
+# `exit 0` so Conductor records success and keeps the outputs.
 ENV_PROBE_COMMAND = (
-    "bash -lc '"
-    "echo ===BEFORE===; echo PATH=$PATH; "
-    'source "$ENV_FILE"; '
-    "echo ===AFTER===; echo PATH=$PATH; "
-    "echo ===WHICH===; "
-    "for b in python python3 accelerate torchrun; do "
+    "bash -c '"
+    "set +e; mkdir -p /lora_discovery; { "
+    'echo ===BEFORE===; echo "PATH=$PATH"; '
+    'echo ===ENVFILE===; cat "$ENV_FILE"; '
+    "echo ===SOURCED_SUBSHELL===; "
+    '( . "$ENV_FILE" >/dev/null 2>&1; echo "source_rc=$?"; echo "PATH_AFTER=$PATH"; '
+    "for b in python python3 accelerate torchrun pip; do "
     'printf "%s -> " "$b"; command -v "$b" || echo MISSING; done; '
-    "echo ===VERSION===; python -V 2>&1 || python3 -V 2>&1; "
-    "echo ===TORCH===; "
-    "python -c \"import torch,sys;print(torch.__version__, torch.cuda.is_available())\" 2>&1 | head -3; "
-    "echo ===ENVFILE===; head -40 \"$ENV_FILE\"; "
-    "echo ===DONE==='"
+    'python -V 2>&1; python -c "import torch;print(\\"torch\\", torch.__version__)" 2>&1 ); '
+    'echo ===KOHYA_BIN===; ls -la "$KOHYA_PATH"; '
+    "echo ===DONE===; "
+    "} > /lora_discovery/probe.txt 2>&1; exit 0'"
 )
 
 

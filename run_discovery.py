@@ -224,6 +224,32 @@ async def main() -> int:
     if ids:
         print(f"  internal job id: {ids.get('job_id')}  task_keys: {ids.get('task_keys')}")
 
+    # Output FILES come back reliably even though the log API does not, so try
+    # them first — the env probe writes its findings to probe.txt for exactly
+    # this reason.
+    print("\nFetching output files...")
+    try:
+        outs = await conductor.get_job_outputs(str(jid))
+        files = [f for task in outs.get("downloads", []) for f in (task.get("files") or [])]
+        if not files:
+            print("  (none)")
+        for f in files:
+            url = f.get("url") or f.get("signed_url")
+            name = str(f.get("name") or f.get("relative_path") or f.get("path") or "output")
+            print(f"  {name}")
+            if url and name.endswith(".txt"):
+                import httpx
+
+                async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                    resp = await client.get(url)
+                if resp.is_success:
+                    print("\n" + "=" * 72)
+                    print(resp.text)
+                    print("=" * 72)
+                    return 0
+    except Exception as exc:
+        _log_err(f"output fetch failed: {exc}")
+
     print("\nFetching task log...")
     report(await fetch_log(str(jid)))
     return 0
