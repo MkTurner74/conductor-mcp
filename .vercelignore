@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 conductor_key.json
 .env
+Dockerfile
