@@ -145,7 +145,10 @@ class ProvenanceFieldTests(unittest.TestCase):
         self.assertEqual(by_name["prov_base_model"], "sdxl1-kohya")
         self.assertEqual(by_name["prov_label"], "Aston Martin F1 Livery v1")
         self.assertEqual(by_name["prov_prompt2"], "amf1 livery, studio lighting")
-        self.assertEqual(by_name["prov_created_by"], "mark@example.com")
+        # The "3" is load-bearing: prov_created_by and prov_created_by2 exist on
+        # the group as burnt earlier attempts. This test fails if anyone tidies
+        # the mapping back to the bare name.
+        self.assertEqual(by_name["prov_created_by3"], "mark@example.com")
         self.assertEqual(by_name["prov_source_assets"], "VX-4422")
 
 

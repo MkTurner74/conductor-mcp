@@ -827,12 +827,16 @@ PROVENANCE_FIELD_IDS = {
     "prompt": "prov_prompt2",
     "source_asset_ids": "prov_source_assets",
     "job_id": "prov_job_id",
-    # Who ran it. Not yet present on Codemill's demo Portal -- field CREATION
-    # and group ATTACHMENT are both admin-UI-only on Cantemo (no v2 route, and
-    # Vidispine's metadataelement path does not attach). So this is mapped here
-    # and written the moment somebody adds it; until then it is reported as
-    # skipped rather than silently dropped. See _writable_provenance_fields.
-    "created_by": "prov_created_by",
+    # Who ran it. Added by Mark in the Portal admin UI on 2026-08-31 -- field
+    # CREATION and group ATTACHMENT are both admin-UI-only on Cantemo (no v2
+    # route, and Vidispine's metadataelement path does not attach).
+    #
+    # The "3" is not a typo and must not be "tidied" back to the bare name.
+    # Cantemo will not reuse a field id, so a half-finished creation burns it:
+    # `prov_created_by` and `prov_created_by2` both exist on the group as dead
+    # earlier attempts, exactly as `prov_prompt2` did before. **prov_created_by3
+    # is the live one** -- verified by writing and reading it back on VX-4422.
+    "created_by": "prov_created_by3",
 }
 
 # Cached list of field ids actually attached to the provenance group on THIS
