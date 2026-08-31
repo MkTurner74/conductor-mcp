@@ -464,6 +464,53 @@ async def cantemo_remove_from_collection(
 
 
 @mcp.tool()
+async def cantemo_list_loras(
+    limit: Annotated[int, Field(description="Max results. Default 50")] = 50,
+) -> str:
+    """
+    Every trained LoRA in the MAM, with the trigger word each was trained with.
+
+    Exists so nobody has to remember a Cantemo id or, worse, a trigger token.
+    A LoRA does NOTHING unless its trigger word appears in the prompt, so the
+    two facts have to travel together — this returns them as one row, which is
+    what the inference step's dropdown is built from.
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        data = await cantemo.search(
+            query="",
+            fields=["id", "title", "prov_label", "prov_trigger_word", "prov_base_model", "prov_job_id"],
+            terms=[{"name": "prov_kind", "value": "lora"}],
+            limit=limit,
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+
+    def first(row: dict, key: str) -> Optional[str]:
+        v = row.get(key)
+        if isinstance(v, list):
+            return str(v[0]) if v else None
+        return str(v) if v is not None else None
+
+    loras = []
+    for r in (data or {}).get("results", []):
+        item_id = r.get("id")
+        if not item_id:
+            continue
+        label = first(r, "prov_label") or (first(r, "title") or "").replace("LoRA -- ", "").strip()
+        loras.append({
+            "item_id": item_id,
+            "label": label or item_id,
+            "trigger_word": first(r, "prov_trigger_word") or "",
+            "base_model": first(r, "prov_base_model") or "",
+            "trained_by_job": first(r, "prov_job_id") or "",
+        })
+    loras.sort(key=lambda x: x["label"].lower())
+    return json.dumps({"count": len(loras), "loras": loras}, indent=2)
+
+
+@mcp.tool()
 async def cantemo_get_asset(
     item_id: Annotated[str, Field(description="Cantemo item id, e.g. VX-4153")],
 ) -> str:
