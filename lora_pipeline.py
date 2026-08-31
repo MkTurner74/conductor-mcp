@@ -54,6 +54,8 @@ import shutil
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import httpx
+
 import cantemo_client as cantemo
 import conductor_client as conductor
 
@@ -83,6 +85,47 @@ REL_TRAINED_FROM = "lora_trained_from"
 REL_GENERATED_WITH = "generated_with_lora"
 
 PROVENANCE_GROUP = "AI Provenance"
+
+def default_workdir() -> str:
+    """
+    Where training images are staged before upload.
+
+    This is not a cosmetic default. Conductor uploads preserve the path, and the
+    render node runs tasks as the user `conductor` -- so a file staged under
+    /root lands at /root on the node and the trainer cannot read its own dataset.
+    That is exactly how job 00014 died: submitted from a container running as
+    root, it failed with
+
+        PermissionError: [Errno 13] Permission denied:
+          '/root/.conductor-lora/aston-martin-f1-livery-v1/dataset'
+
+    while the identical code submitted from a laptop (home = a Windows user
+    directory, node path /Users/<name>/...) succeeded. The difference was never
+    the code.
+
+    So: use the home directory when it is a normal one, and fall back to a
+    neutral path when running as root. Fixing this here rather than with an
+    environment variable means a fresh container cannot reintroduce it by being
+    deployed without the variable set.
+
+    LORA_WORKDIR still overrides, for the case this does not anticipate.
+    """
+    override = os.getenv("LORA_WORKDIR")
+    if override:
+        return override
+    home = os.path.expanduser("~")
+    # A root home is the trap. Anything else -- a laptop, a normal service user
+    # -- maps to a node path the `conductor` user can read.
+    if not home or home in ("/root", "/") or home.startswith("/root/"):
+        return "/Users/samsyn/.conductor-lora"
+    return os.path.join(home, ".conductor-lora")
+
+
+# Where AI outputs are filed in the MAM. Deliberately NOT the collection the
+# training set is read from -- see cantemo_client.ensure_collection.
+WORKBENCH_COLLECTION = "AI Workbench"
+LORA_MODELS_COLLECTION = "LoRA Models"
+LORA_OUTPUT_COLLECTION = "LoRA Output"
 
 # Job states as they appear on the Cantemo item, so the whole round trip can be
 # watched from the MAM without anyone opening Conductor's dashboard.
@@ -784,27 +827,71 @@ PROVENANCE_FIELD_IDS = {
     "prompt": "prov_prompt2",
     "source_asset_ids": "prov_source_assets",
     "job_id": "prov_job_id",
+    # Who ran it. Not yet present on Codemill's demo Portal -- field CREATION
+    # and group ATTACHMENT are both admin-UI-only on Cantemo (no v2 route, and
+    # Vidispine's metadataelement path does not attach). So this is mapped here
+    # and written the moment somebody adds it; until then it is reported as
+    # skipped rather than silently dropped. See _writable_provenance_fields.
+    "created_by": "prov_created_by",
 }
 
+# Cached list of field ids actually attached to the provenance group on THIS
+# Portal. Writing a field that exists but is not attached to the group returns
+# "400 notFound metadata-field", so presence has to mean "attached", which is
+# exactly what get_metadata_group reports.
+_group_fields_cache: Optional[set[str]] = None
 
-def _provenance_fields(values: dict) -> list[dict]:
-    """
-    Flatten a provenance dict into Cantemo metadata fields, translating our
-    logical names into the Portal's field ids.
 
-    An unmapped key would be written under a name the Portal does not know and
-    silently discarded, so it raises instead -- a provenance record that loses
-    fields without saying so is worse than one that fails loudly.
+async def provenance_group_fields(refresh: bool = False) -> set[str]:
+    global _group_fields_cache
+    if _group_fields_cache is not None and not refresh:
+        return _group_fields_cache
+    try:
+        group = await cantemo.get_metadata_group(PROVENANCE_GROUP)
+        _group_fields_cache = {
+            str(f.get("name")) for f in (group or {}).get("fields", []) if f.get("name")
+        }
+    except Exception as exc:
+        _logger.error("[lora] could not read provenance group: %s", exc)
+        _group_fields_cache = set()
+    return _group_fields_cache
+
+
+async def _writable_provenance_fields(values: dict) -> tuple[list[dict], list[str]]:
     """
-    out = []
+    Translate provenance values into fields this Portal will actually accept.
+
+    Two different failure modes, deliberately treated differently:
+
+      * An UNMAPPED key is a bug in our code -- raise, because a provenance
+        record that quietly loses a field is worse than one that fails.
+      * A MAPPED key whose field is not attached to the group on this Portal is
+        an install difference, not a bug. Writing it would 400 the whole
+        metadata call and lose the other seven fields with it. So it is skipped
+        and REPORTED, and it starts working by itself once someone adds the
+        field in the admin UI -- no code change, no redeploy.
+
+    Returns (fields, skipped_logical_names).
+    """
+    available = await provenance_group_fields()
+    fields: list[dict] = []
+    skipped: list[str] = []
     for key, value in values.items():
-        if value is None:
+        if value is None or value == "":
             continue
         field_id = PROVENANCE_FIELD_IDS.get(key)
         if not field_id:
             raise KeyError(f"No Cantemo field id mapped for provenance key {key!r}")
-        out.append({"name": field_id, "value": str(value)})
-    return out
+        # An empty available-set means we could not read the group at all --
+        # attempt the write rather than skipping everything on a transient read
+        # failure.
+        if available and field_id not in available:
+            skipped.append(f"{key} ({field_id})")
+            continue
+        fields.append({"name": field_id, "value": str(value)})
+    return fields, skipped
+
+
 
 
 async def ingest_lora_to_cantemo(
@@ -815,6 +902,7 @@ async def ingest_lora_to_cantemo(
     trigger_word: str,
     created_by: str,
     notranscode: bool = True,
+    collection: Optional[str] = LORA_MODELS_COLLECTION,
 ) -> dict:
     """
     Pull the trained .safetensors off Conductor and land it in the MAM as a new
@@ -831,7 +919,25 @@ async def ingest_lora_to_cantemo(
         if output_name(f).endswith(".safetensors")
     ]
     if not weights:
-        return {"ok": False, "error": f"No .safetensors in outputs of job {job_id}", "outputs": outputs}
+        # "No .safetensors" is a symptom. The cause is in the job's own log, and
+        # we already have the outputs in hand -- so say what actually happened
+        # rather than making the next person go and find it.
+        detail = await training_failure_detail(outputs)
+        produced = sorted(
+            output_name(f)
+            for task in outputs.get("downloads", [])
+            for f in task.get("files", [])
+        )
+        error = f"Training job {job_id} produced no weights"
+        if detail:
+            error += f". The trainer reported: {detail}"
+        return {
+            "ok": False,
+            "error": error,
+            "job_id": job_id,
+            "produced_files": produced,
+            "outputs": outputs,
+        }
 
     weight = weights[0]
     url = weight.get("url") or weight.get("signed_url")
@@ -844,20 +950,18 @@ async def ingest_lora_to_cantemo(
         return {"ok": False, "error": "Could not read new item id", "response": item}
 
     await cantemo.import_uri(item_id, url, notranscode=notranscode)
-    await cantemo.set_metadata(
-        item_id,
-        _provenance_fields(
-            {
-                "provenance_kind": "lora",
-                "label": label,
-                "base_model": base_model,
-                "trigger_word": trigger_word,
-                "job_id": job_id,
-                "source_asset_ids": ",".join(source_item_ids),
-            }
-        ),
-        group_name=PROVENANCE_GROUP,
+    prov_fields, prov_skipped = await _writable_provenance_fields(
+        {
+            "provenance_kind": "lora",
+            "label": label,
+            "base_model": base_model,
+            "trigger_word": trigger_word,
+            "job_id": job_id,
+            "source_asset_ids": ",".join(source_item_ids),
+            "created_by": created_by,
+        }
     )
+    await cantemo.set_metadata(item_id, prov_fields, group_name=PROVENANCE_GROUP)
 
     # The edges are the point: every training asset becomes a traversable
     # relation, so the MAM itself can answer "what was this trained on".
@@ -869,6 +973,8 @@ async def ingest_lora_to_cantemo(
         except Exception as exc:
             failed.append({"item_id": src, "error": str(exc)})
 
+    filed = await _file_into(collection, [item_id])
+
     return {
         "ok": True,
         "item_id": item_id,
@@ -876,7 +982,81 @@ async def ingest_lora_to_cantemo(
         "weights_file": output_name(weight),
         "related": linked,
         "relation_failures": failed,
+        "filed": filed,
+        "provenance_written": [f["name"] for f in prov_fields],
+        "provenance_skipped": prov_skipped,
     }
+
+
+async def _file_into(collection: Optional[str], item_ids: list[str]) -> Optional[dict]:
+    """File freshly created items, never fatal -- the asset exists either way."""
+    if not collection or not item_ids:
+        return None
+    try:
+        coll_id = await cantemo.ensure_collection(collection, parent_name=WORKBENCH_COLLECTION)
+        if not coll_id:
+            return {"collection": collection, "error": "could not find or create"}
+        await cantemo.add_to_collection(coll_id, item_ids)
+        return {"collection": collection, "collection_id": coll_id, "filed": len(item_ids)}
+    except Exception as exc:
+        return {"collection": collection, "error": f"{type(exc).__name__}: {exc}"}
+
+
+async def training_failure_detail(outputs: dict) -> Optional[str]:
+    """
+    Explain why a job that Conductor calls "success" produced no weights.
+
+    The wrapper script's exit code is not the trainer's. kohya can die and the
+    task still ends 0, so the job reads green while `output_path` holds nothing
+    but a log. When that happens the ONLY honest report is what the trainer
+    said, and it is already sitting in the outputs we just fetched.
+
+    Job 00014 is the case this exists for: it reported success, produced only
+    train.log and train_status.txt, and the caller said "No .safetensors in
+    outputs" -- true, useless, and pointing at the wrong layer. The real cause
+    was three lines down in train.log (a PermissionError on the dataset, from
+    staging under /root when the render node runs tasks as `conductor`).
+
+    Returns a human-readable cause, or None if the outputs say nothing useful.
+    """
+    files = [f for task in outputs.get("downloads", []) for f in task.get("files", [])]
+    by_name = {output_name(f): f for f in files}
+
+    async def fetch(name: str) -> str:
+        f = by_name.get(name)
+        url = (f or {}).get("url") or (f or {}).get("signed_url")
+        if not url:
+            return ""
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                return r.text
+        except Exception:
+            return ""
+
+    status = (await fetch("train_status.txt")).strip()
+    log = await fetch("train.log")
+
+    if not status and not log:
+        return None
+
+    # The last traceback line names the actual failure; the noise above it is
+    # deprecation warnings nobody needs to read.
+    cause = ""
+    if log:
+        lines = [ln.rstrip() for ln in log.splitlines() if ln.strip()]
+        for ln in reversed(lines):
+            if any(ln.startswith(p) for p in ("PermissionError", "FileNotFoundError", "RuntimeError",
+                                              "OSError", "ValueError", "AssertionError",
+                                              "torch.cuda.OutOfMemoryError")):
+                cause = ln
+                break
+        if not cause:
+            cause = " / ".join(lines[-3:])
+
+    parts = [p for p in (status or None, cause or None) if p]
+    return " -- ".join(parts) if parts else None
 
 
 def output_name(f: dict) -> str:
@@ -941,19 +1121,20 @@ async def create_tracked_lora_item(
     if not item_id:
         return {"ok": False, "error": "Could not read new item id", "response": item}
 
+    tracked_fields, _ = await _writable_provenance_fields(
+        {
+            "provenance_kind": "lora",
+            "status": STATUS_SUBMITTED,
+            "label": label,
+            "base_model": base_model,
+            "trigger_word": trigger_word,
+            "job_id": job_id,
+            "source_asset_ids": ",".join(source_item_ids),
+        }
+    )
     await cantemo.set_metadata(
         item_id,
-        _provenance_fields(
-            {
-                "provenance_kind": "lora",
-                "status": STATUS_SUBMITTED,
-                "label": label,
-                "base_model": base_model,
-                "trigger_word": trigger_word,
-                "job_id": job_id,
-                "source_asset_ids": ",".join(source_item_ids),
-            }
-        ),
+        tracked_fields,
         group_name=PROVENANCE_GROUP,
     )
 
@@ -988,7 +1169,7 @@ async def sync_status_to_mam(item_id: str, job_id: str, kind: str = "lora") -> d
         mapped = STATUS_SUBMITTED
 
     await cantemo.set_metadata(
-        item_id, _provenance_fields({"status": mapped}), group_name=PROVENANCE_GROUP
+        item_id, (await _writable_provenance_fields({"status": mapped}))[0], group_name=PROVENANCE_GROUP
     )
     return {"item_id": item_id, "conductor_status": status.get("status"), "mam_status": mapped,
             "terminal": status.get("terminal")}
@@ -1010,7 +1191,7 @@ async def finalize_tracked_lora(item_id: str, job_id: str) -> dict:
     ]
     if not weights:
         await cantemo.set_metadata(
-            item_id, _provenance_fields({"status": STATUS_FAILED}), group_name=PROVENANCE_GROUP
+            item_id, (await _writable_provenance_fields({"status": STATUS_FAILED}))[0], group_name=PROVENANCE_GROUP
         )
         return {"ok": False, "error": f"No .safetensors in outputs of job {job_id}"}
 
@@ -1020,7 +1201,7 @@ async def finalize_tracked_lora(item_id: str, job_id: str) -> dict:
 
     await cantemo.import_uri(item_id, url, notranscode=True)
     await cantemo.set_metadata(
-        item_id, _provenance_fields({"status": STATUS_READY}), group_name=PROVENANCE_GROUP
+        item_id, (await _writable_provenance_fields({"status": STATUS_READY}))[0], group_name=PROVENANCE_GROUP
     )
     return {"ok": True, "item_id": item_id, "weights_file": output_name(weights[0])}
 
@@ -1055,24 +1236,67 @@ async def stamp_source_assets(
     stamped, failed = [], []
     for item_id in source_item_ids:
         try:
-            await cantemo.set_metadata(
-                item_id,
-                _provenance_fields(
-                    {
-                        "provenance_kind": "training_source",
-                        "status": STATUS_READY,
-                        "label": label,
-                        "base_model": base_model,
-                        "trigger_word": trigger_word,
-                        "job_id": job_id,
-                    }
-                ),
-                group_name=PROVENANCE_GROUP,
+            stamp_fields, _ = await _writable_provenance_fields(
+                {
+                    "provenance_kind": "training_source",
+                    "status": STATUS_READY,
+                    "label": label,
+                    "base_model": base_model,
+                    "trigger_word": trigger_word,
+                    "job_id": job_id,
+                }
             )
+            await cantemo.set_metadata(item_id, stamp_fields, group_name=PROVENANCE_GROUP)
             stamped.append(item_id)
         except Exception as exc:
             failed.append({"item_id": item_id, "error": f"{type(exc).__name__}: {exc}"})
     return {"ok": not failed, "stamped": stamped, "failures": failed, "count": len(stamped)}
+
+
+async def lora_identity(lora_item_id: str) -> dict:
+    """
+    Read a LoRA item's own provenance back out of the MAM.
+
+    Generated images have to name the model that made them, and the caller
+    should not have to remember what that model was called -- the MAM already
+    knows. Reading it here rather than passing it in means the label on an image
+    can never drift from the label on the LoRA it came from.
+
+    Falls back to the item title (minus the "LoRA -- " prefix the ingest adds)
+    when the provenance fields are not readable.
+    """
+    label, trigger = "", ""
+    try:
+        meta = await cantemo.get_metadata(lora_item_id)
+        # The metadata document nests differently by Portal version, so walk it
+        # rather than assuming one shape.
+        def walk(node: Any) -> None:
+            nonlocal label, trigger
+            if isinstance(node, dict):
+                name, value = node.get("name"), node.get("value")
+                if name == "prov_label" and value:
+                    label = str(value if not isinstance(value, list) else value[0])
+                if name == "prov_trigger_word" and value:
+                    trigger = str(value if not isinstance(value, list) else value[0])
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(meta)
+    except Exception as exc:
+        _logger.error("[lora] could not read provenance of %s: %s", lora_item_id, exc)
+
+    if not label:
+        try:
+            item = await cantemo.get_item(lora_item_id)
+            title = item.get("title") or ""
+            if isinstance(title, list):
+                title = title[0] if title else ""
+            label = str(title).replace("LoRA -- ", "").replace("LoRA — ", "").strip()
+        except Exception:
+            pass
+    return {"label": label, "trigger_word": trigger}
 
 
 async def ingest_generated_images(
@@ -1081,6 +1305,7 @@ async def ingest_generated_images(
     prompt: str,
     base_model: str,
     created_by: str,
+    collection: Optional[str] = LORA_OUTPUT_COLLECTION,
 ) -> dict:
     """
     Land inference output back in the MAM, each image related to the LoRA that
@@ -1094,7 +1319,19 @@ async def ingest_generated_images(
         if output_name(f).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     ]
     if not images:
-        return {"ok": False, "error": f"No images in outputs of job {job_id}"}
+        detail = await training_failure_detail(outputs)
+        produced = sorted(
+            output_name(f)
+            for task in outputs.get("downloads", [])
+            for f in task.get("files", [])
+        )
+        error = f"Inference job {job_id} produced no images"
+        if detail:
+            error += f". The generator reported: {detail}"
+        return {"ok": False, "error": error, "job_id": job_id, "produced_files": produced}
+
+    identity = await lora_identity(lora_item_id)
+    skipped_report: list[str] = []
 
     created = []
     for idx, img in enumerate(images, start=1):
@@ -1106,25 +1343,43 @@ async def ingest_generated_images(
         if not item_id:
             continue
         await cantemo.import_uri(item_id, url, notranscode=False)
-        await cantemo.set_metadata(
-            item_id,
-            _provenance_fields(
-                {
-                    "provenance_kind": "generated_image",
-                    "prompt": prompt,
-                    "base_model": base_model,
-                        "job_id": job_id,
-                        }
-            ),
-            group_name=PROVENANCE_GROUP,
+        # Everything needed to answer "what made this, from what, and who asked"
+        # WITHOUT leaving the asset: the base model, the LoRA by name, its
+        # trigger word, the full prompt, the person, and the compute job.
+        # The relation edge below carries the same link as graph structure; the
+        # metadata carries it as text, because a person reading the asset panel
+        # should not have to traverse anything.
+        prov_fields, prov_skipped = await _writable_provenance_fields(
+            {
+                "provenance_kind": "generated_image",
+                "label": identity["label"],
+                "trigger_word": identity["trigger_word"],
+                "prompt": prompt,
+                "base_model": base_model,
+                "job_id": job_id,
+                "source_asset_ids": lora_item_id,
+                "created_by": created_by,
+            }
         )
+        skipped_report = prov_skipped
+        await cantemo.set_metadata(item_id, prov_fields, group_name=PROVENANCE_GROUP)
         try:
             await cantemo.create_relation(item_id, lora_item_id, relation_type=REL_GENERATED_WITH)
         except Exception as exc:
             _logger.error("[lora] relation %s -> %s failed: %s", item_id, lora_item_id, exc)
         created.append(item_id)
 
-    return {"ok": True, "job_id": job_id, "items": created, "count": len(created)}
+    filed = await _file_into(collection, created)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "items": created,
+        "count": len(created),
+        "filed": filed,
+        "lora": {"item_id": lora_item_id, **identity},
+        "provenance_skipped": skipped_report,
+    }
 
 
 def cleanup_workdir(workdir: str) -> None:

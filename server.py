@@ -17,6 +17,7 @@ import cantemo_client as cantemo
 import conductor_client as conductor
 import conductor_render
 import lora_pipeline
+import submissions
 
 # Stateless mode (no in-memory MCP sessions) is required on serverless hosts
 # (Vercel) where each request may hit a fresh instance. Local uvicorn keeps
@@ -230,6 +231,23 @@ async def kill_jobs(job_ids: list[int], action: str = "kill") -> str:
 
 
 @mcp.tool()
+async def get_submission_status(
+    submission_id: Annotated[str, Field(description="Ticket returned by submit_lora_training / submit_lora_inference with background=true")],
+    label: Annotated[str, Field(description="The label the submission was started with. Only used to recover a ticket lost to a server restart — pass it and a restart costs nothing")] = "",
+) -> str:
+    """
+    Where a background submission has got to.
+
+    States: staging (still uploading) · submitted (has a Conductor jid — poll
+    that with get_render_status from here) · dry_run · failed · unknown.
+
+    "unknown" means this server has never heard of the ticket AND Conductor has
+    no job matching the label. Treat it as a failure rather than polling on.
+    """
+    return json.dumps(await submissions.status(submission_id, label), indent=2, default=str)
+
+
+@mcp.tool()
 async def get_job_outputs(job_id: str, task_ids: list[str] = None) -> str:
     """
     List the rendered output files of a completed job, each with a signed
@@ -349,6 +367,7 @@ async def cantemo_collection_items(
 async def cantemo_add_to_collection(
     collection_name: Annotated[str, Field(description='Collection to file the items into, e.g. "LoRA Output". Created if absent')],
     item_ids: Annotated[list[str], Field(description="Cantemo item ids to add")],
+    parent_collection: Annotated[str, Field(description='Parent to nest a newly created collection under. Defaults to "AI Workbench" so outputs group together in the tree')] = "AI Workbench",
 ) -> str:
     """
     File items into a named Cantemo collection, creating it if it does not exist.
@@ -365,7 +384,7 @@ async def cantemo_add_to_collection(
         coll_id = await cantemo.find_collection(collection_name)
         created = False
         if not coll_id:
-            coll_id = await cantemo.create_collection(collection_name)
+            coll_id = await cantemo.ensure_collection(collection_name, parent_name=parent_collection or None)
             created = True
         if not coll_id:
             return json.dumps({"error": f'Could not find or create "{collection_name}"'}, indent=2)
@@ -471,6 +490,7 @@ async def submit_lora_training(
     model: Annotated[str, Field(description="Base model: sdxl, flux-schnell, flux-dev, sd35-large, sd35-medium, sd3-medium")] = "sdxl",
     epochs: Annotated[int, Field(description="Training epochs. Default 10")] = 10,
     dry_run: Annotated[bool, Field(description="True (default) builds and validates the job WITHOUT spending GPU money. Set false only on explicit instruction")] = True,
+    background: Annotated[bool, Field(description="Return a submission ticket immediately instead of waiting for the image upload to finish. Poll it with get_submission_status. Use this from any caller that cannot hold a request open for minutes")] = False,
 ) -> str:
     """
     Train a LoRA on CoreWeave GPUs from assets selected in the Cantemo MAM.
@@ -487,11 +507,11 @@ async def submit_lora_training(
     if err := _cantemo_guard():
         return err
     workdir = os.path.join(
-        os.getenv("LORA_WORKDIR", os.path.join(os.path.expanduser("~"), ".conductor-lora")),
+        lora_pipeline.default_workdir(),
         "".join(ch if ch.isalnum() else "-" for ch in label).strip("-").lower(),
     )
-    try:
-        result = await lora_pipeline.submit_training(
+    def _run():
+        return lora_pipeline.submit_training(
             dry_run=dry_run,
             item_ids=item_ids,
             label=label,
@@ -501,6 +521,19 @@ async def submit_lora_training(
             class_word=class_word,
             epochs=epochs,
         )
+
+    # Staging pulls every training image out of the MAM and pushes it through
+    # ciocore's uploader. That is minutes of work, so a caller that cannot hold
+    # a request open takes a ticket instead.
+    if background:
+        submission_id = submissions.start(label, _run)
+        return json.dumps(
+            {"submission_id": submission_id, "state": "staging", "label": label, "dry_run": dry_run},
+            indent=2,
+        )
+
+    try:
+        result = await _run()
     except Exception as exc:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
     return json.dumps(result, indent=2, default=str)
@@ -514,6 +547,7 @@ async def ingest_lora_to_mam(
     trigger_word: Annotated[str, Field(description="The trigger token used during training")] = "sks",
     base_model: Annotated[str, Field(description="Base model product it was trained against")] = "sdxl1-kohya",
     created_by: Annotated[str, Field(description="Who ran the training")] = "NearlyMe",
+    collection: Annotated[str, Field(description='Collection to file the LoRA into, nested under "AI Workbench". Created if absent. Deliberately NOT the training collection, which is read as input on every run')] = "LoRA Models",
 ) -> str:
     """
     Land a finished LoRA back in the Cantemo MAM with full provenance.
@@ -528,6 +562,7 @@ async def ingest_lora_to_mam(
         result = await lora_pipeline.ingest_lora_to_cantemo(
             job_id=job_id, label=label, source_item_ids=source_item_ids,
             base_model=base_model, trigger_word=trigger_word, created_by=created_by,
+            collection=collection or None,
         )
     except Exception as exc:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
@@ -543,6 +578,7 @@ async def submit_lora_inference(
     seed: Annotated[int, Field(description="Random seed for reproducibility. Default 42")] = 42,
     model: Annotated[str, Field(description="Base model the LoRA was trained against. Default sdxl")] = "sdxl",
     dry_run: Annotated[bool, Field(description="True (default) builds the job WITHOUT spending GPU money. Set false only on explicit instruction")] = True,
+    background: Annotated[bool, Field(description="Return a submission ticket immediately instead of waiting for the weights upload. Poll it with get_submission_status")] = False,
 ) -> str:
     """
     Generate images from a LoRA held in the Cantemo MAM.
@@ -554,15 +590,24 @@ async def submit_lora_inference(
     """
     if err := _cantemo_guard():
         return err
-    workdir = os.path.join(
-        os.getenv("LORA_WORKDIR", os.path.join(os.path.expanduser("~"), ".conductor-lora")),
-        "infer", lora_item_id,
-    )
-    try:
-        result = await lora_pipeline.submit_inference(
+    workdir = os.path.join(lora_pipeline.default_workdir(), "infer", lora_item_id)
+    def _run():
+        return lora_pipeline.submit_inference(
             dry_run=dry_run, lora_item_id=lora_item_id, prompt=prompt,
             workdir=workdir, count=count, steps=steps, seed=seed, model=model,
         )
+
+    # Inference stages the LoRA weights themselves (a few hundred MB), so it is
+    # the same shape of wait as training.
+    if background:
+        submission_id = submissions.start(lora_item_id, _run)
+        return json.dumps(
+            {"submission_id": submission_id, "state": "staging", "label": lora_item_id, "dry_run": dry_run},
+            indent=2,
+        )
+
+    try:
+        result = await _run()
     except Exception as exc:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
     return json.dumps(result, indent=2, default=str)
@@ -575,6 +620,7 @@ async def ingest_generated_to_mam(
     prompt: Annotated[str, Field(description="The prompt used — recorded on every generated item")],
     base_model: Annotated[str, Field(description="Base model product")] = "sdxl1-kohya",
     created_by: Annotated[str, Field(description="Who ran the generation")] = "NearlyMe",
+    collection: Annotated[str, Field(description='Collection to file the generated images into, nested under "AI Workbench". Created if absent')] = "LoRA Output",
 ) -> str:
     """
     Land generated images back in the Cantemo MAM, each carrying its prompt and
@@ -586,6 +632,7 @@ async def ingest_generated_to_mam(
         result = await lora_pipeline.ingest_generated_images(
             job_id=job_id, lora_item_id=lora_item_id, prompt=prompt,
             base_model=base_model, created_by=created_by,
+            collection=collection or None,
         )
     except Exception as exc:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)

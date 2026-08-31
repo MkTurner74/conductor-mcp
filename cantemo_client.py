@@ -155,6 +155,28 @@ async def create_collection(name: str, parent_id: Optional[str] = None) -> Optio
     return (data or {}).get("id")
 
 
+async def ensure_collection(name: str, parent_name: Optional[str] = None) -> Optional[str]:
+    """
+    Find a collection by name, creating it -- and its parent -- if absent.
+
+    Why outputs get their own collections rather than going back into the input
+    one: "Train LoRA" is READ BY NAME at the start of every training run, so
+    anything filed there becomes training data next time. Inputs and outputs
+    have to be separate folders or the workflow feeds on its own results.
+
+    The link back to the source assets is the relation edge, not folder
+    membership -- which is the stronger claim anyway: the MAM answers "what was
+    this trained on" by traversal, regardless of where someone filed it.
+    """
+    existing = await find_collection(name)
+    if existing:
+        return existing
+    parent_id = None
+    if parent_name:
+        parent_id = await find_collection(parent_name) or await create_collection(parent_name)
+    return await create_collection(name, parent_id=parent_id)
+
+
 async def add_to_collection(collection_id: str, item_ids: list[str]) -> Optional[str]:
     """
     Add existing items to a collection without moving them.
