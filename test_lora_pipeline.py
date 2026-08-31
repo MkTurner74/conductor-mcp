@@ -196,5 +196,69 @@ class TrainingFailureDetailTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(lp.training_failure_detail({"downloads": []})))
 
 
+class PromptQuotingTests(unittest.TestCase):
+    """
+    A prompt has spaces. That is the entire bug.
+
+    Job 00015 -- the first inference run ever -- reported SUCCESS and produced
+    no images. The prompt was interpolated into a command already wrapped in
+    bash -c '...', where a backslash is literal, so the node received
+    `--prompt \\"amf1 livery, studio...` and argparse died on the leftovers.
+    """
+
+    def test_prompt_is_not_interpolated_into_the_command(self):
+        self.assertNotIn("{prompt}", lp.INFER_COMMAND_TEMPLATE,
+                         "the prompt must not be substituted into a shell string")
+        self.assertIn('--prompt "$LORA_PROMPT"', lp.INFER_COMMAND_TEMPLATE)
+
+    def test_template_still_formats_without_a_prompt_argument(self):
+        # If the placeholder came back, this raises KeyError -- which is a
+        # better failure than a job that succeeds and generates nothing.
+        cmd = lp.INFER_COMMAND_TEMPLATE.format(
+            launcher="python", lora_path="/x/l.safetensors", output_path="/out",
+            count=4, width=1024, height=1024, steps=30, seed=42,
+        )
+        self.assertIn('--prompt "$LORA_PROMPT"', cmd)
+
+    def test_punctuation_survives(self):
+        # Quotes used to be stripped because they broke the shell. They no
+        # longer can, so a real prompt keeps its meaning and its punctuation.
+        raw = chr(10).join(['a "quoted" prompt', "  with a break"])
+        self.assertEqual(" ".join(raw.split()), 'a "quoted" prompt with a break')
+
+class InferenceDiagnosisTests(unittest.TestCase):
+    """The diagnostic has to know inference filenames, not just training ones."""
+
+    def test_reads_infer_log_and_argparse_error(self):
+        # argparse does not raise -- it prints usage and exits 2. That is what
+        # a mis-quoted prompt looks like, so the parser has to recognise it
+        # alongside the exceptions or the cause stays invisible.
+        log = chr(10).join([
+            "usage: sdxl_gen_img.py [-h] [--ckpt CKPT]",
+            "sdxl_gen_img.py: error: unrecognized arguments: livery, studio lighting",
+        ])
+
+        class FakeResponse:
+            def __init__(self, text): self.text = text
+            def raise_for_status(self): return None
+
+        class FakeClient:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, url):
+                return FakeResponse("infer_rc=2" if "status" in url else log)
+
+        outputs = {"downloads": [{"files": [
+            {"relative_path": "infer_status.txt", "url": "https://x/status"},
+            {"relative_path": "infer.log", "url": "https://x/log"},
+        ]}]}
+
+        with mock.patch.object(lp.httpx, "AsyncClient", FakeClient):
+            detail = asyncio.run(lp.training_failure_detail(outputs))
+
+        self.assertIn("infer_rc=2", detail)
+        self.assertIn("unrecognized arguments", detail)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

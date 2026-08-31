@@ -648,6 +648,22 @@ async def submit_training(dry_run: bool = True, **kwargs) -> dict:
 # software stack, and the base model is again already on the node.
 # Same shape as training, and for the same two reasons — sdxl_gen_img.py also
 # imports networks.lora, and a failed generation is just as invisible.
+# The prompt travels in the ENVIRONMENT, not in the command string.
+#
+# It used to be interpolated into the command. That cannot work: the whole thing
+# is wrapped in bash -c '...', and inside SINGLE quotes a backslash is a literal
+# character, not an escape. So the node received
+#
+#     --prompt \"amf1 livery, studio lighting, three-quarter front view...
+#
+# bash split that on spaces, sdxl_gen_img.py took the first word as the prompt
+# and died with "error: unrecognized arguments: livery, studio lighting, ...".
+# Job 00015 reported SUCCESS and produced no images -- the wrapper's exit code
+# is not the generator's, exactly the trap job 00014 set for training.
+#
+# Passing it through the environment removes the quoting problem instead of
+# escaping around it: a prompt cannot break out of a shell command it never
+# appears in. Apostrophes and punctuation work now as a side effect.
 INFER_COMMAND_TEMPLATE = (
     "bash -c '"
     "set +e; mkdir -p {output_path}; "
@@ -658,7 +674,7 @@ INFER_COMMAND_TEMPLATE = (
     " --network_module networks.lora"
     " --network_weights {lora_path}"
     " --outdir {output_path}"
-    ' --prompt \\"{prompt}\\"'
+    ' --prompt "$LORA_PROMPT"'
     " --images_per_prompt {count}"
     " --W {width} --H {height}"
     " --steps {steps}"
@@ -723,15 +739,16 @@ async def build_inference_job(
     env = dict(packages["environment"])
     output_path = f"/lora_inference/{lora_item_id}"
 
-    # Quotes in a prompt would break out of the shell command; strip rather than
-    # attempt to escape, since a demo prompt never needs them.
-    safe_prompt = prompt.replace('"', "").replace("'", "").replace("\n", " ").strip()
+    # Only newlines are stripped now -- they would end the command line itself.
+    # Quotes and apostrophes are safe, because the prompt rides in the
+    # environment rather than being interpolated into a shell string.
+    safe_prompt = " ".join(prompt.split())
+    env["LORA_PROMPT"] = safe_prompt
 
     command = INFER_COMMAND_TEMPLATE.format(
         launcher=launcher,
         lora_path=node_lora_path or node_path(staged["path"]),
         output_path=output_path,
-        prompt=safe_prompt,
         count=count,
         width=width,
         height=height,
@@ -1039,8 +1056,15 @@ async def training_failure_detail(outputs: dict) -> Optional[str]:
         except Exception:
             return ""
 
-    status = (await fetch("train_status.txt")).strip()
-    log = await fetch("train.log")
+    # Training writes train_*, inference writes infer_*. Looking for only one
+    # set is why job 00015's failure went unexplained: the helper found no
+    # train.log, said nothing, and the caller fell back to "produced no images"
+    # -- the same useless symptom this function exists to replace.
+    status = ""
+    log = ""
+    for prefix in ("train", "infer"):
+        status = status or (await fetch(f"{prefix}_status.txt")).strip()
+        log = log or await fetch(f"{prefix}.log")
 
     if not status and not log:
         return None
@@ -1051,6 +1075,12 @@ async def training_failure_detail(outputs: dict) -> Optional[str]:
     if log:
         lines = [ln.rstrip() for ln in log.splitlines() if ln.strip()]
         for ln in reversed(lines):
+            # argparse failures do not raise -- the script prints usage and
+            # exits 2. That is how a mis-quoted prompt looks, so it has to be
+            # recognised alongside the exceptions.
+            if ln.startswith("usage:") or ": error:" in ln:
+                cause = ln
+                break
             if any(ln.startswith(p) for p in ("PermissionError", "FileNotFoundError", "RuntimeError",
                                               "OSError", "ValueError", "AssertionError",
                                               "torch.cuda.OutOfMemoryError")):
