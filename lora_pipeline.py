@@ -687,11 +687,21 @@ INFER_COMMAND_TEMPLATE = (
     ' --ckpt "$MODEL_BASE_HOME"'
     " --network_module networks.lora"
     " --network_weights {lora_path}"
+    # How hard the LoRA pulls. kohya's default is 1.0, which is a polite
+    # suggestion -- a livery LoRA at 1.0 often reads as "a car of roughly that
+    # colour" rather than the specific one it was trained on. Raising it is the
+    # direct control for "it is not sticking to the LoRA"; past about 1.4 it
+    # starts overwhelming the rest of the prompt and everything looks like the
+    # training set regardless of what you asked for.
+    " --network_mul {strength}"
     " --outdir {output_path}"
     ' --prompt "$LORA_PROMPT"'
     " --images_per_prompt {count}"
     " --W {width} --H {height}"
     " --steps {steps}"
+    # Classifier-free guidance: how closely the image follows the prompt at all.
+    # Low values wander, high values go brittle and posterised.
+    " --scale {guidance}"
     " --seed {seed}; "
     "echo infer_rc=$? > {output_path}/infer_status.txt; "
     "}} > {output_path}/infer.log 2>&1; "
@@ -732,6 +742,8 @@ async def build_inference_job(
     height: int = 1024,
     steps: int = 30,
     seed: int = 42,
+    strength: float = 1.0,
+    guidance: float = 7.5,
     project: str = DEFAULT_PROJECT,
     instance_type: str = DEFAULT_INSTANCE_TYPE,
     preemptible: bool = True,
@@ -768,6 +780,8 @@ async def build_inference_job(
         height=height,
         steps=steps,
         seed=seed,
+        strength=strength,
+        guidance=guidance,
     )
 
     job_args = {

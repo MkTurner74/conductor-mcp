@@ -623,6 +623,8 @@ async def submit_lora_inference(
     count: Annotated[int, Field(description="Images to generate. Default 4")] = 4,
     steps: Annotated[int, Field(description="Sampling steps. Default 30")] = 30,
     seed: Annotated[int, Field(description="Random seed for reproducibility. Default 42")] = 42,
+    strength: Annotated[float, Field(description="How hard the LoRA pulls (kohya --network_mul). 1.0 is the default and often too polite; try 1.2-1.3 when the result is not sticking to the trained look. Above ~1.4 it overwhelms the rest of the prompt")] = 1.0,
+    guidance: Annotated[float, Field(description="Classifier-free guidance (--scale): how closely the image follows the prompt. 7.5 default; 9-11 for tighter adherence, higher goes brittle")] = 7.5,
     model: Annotated[str, Field(description="Base model the LoRA was trained against. Default sdxl")] = "sdxl",
     dry_run: Annotated[bool, Field(description="True (default) builds the job WITHOUT spending GPU money. Set false only on explicit instruction")] = True,
     background: Annotated[bool, Field(description="Return a submission ticket immediately instead of waiting for the weights upload. Poll it with get_submission_status")] = False,
@@ -642,6 +644,7 @@ async def submit_lora_inference(
         return lora_pipeline.submit_inference(
             dry_run=dry_run, lora_item_id=lora_item_id, prompt=prompt,
             workdir=workdir, count=count, steps=steps, seed=seed, model=model,
+            strength=strength, guidance=guidance,
         )
 
     # Inference stages the LoRA weights themselves (a few hundred MB), so it is

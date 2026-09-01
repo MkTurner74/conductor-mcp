@@ -217,8 +217,14 @@ class PromptQuotingTests(unittest.TestCase):
         cmd = lp.INFER_COMMAND_TEMPLATE.format(
             launcher="python", lora_path="/x/l.safetensors", output_path="/out",
             count=4, width=1024, height=1024, steps=30, seed=42,
+            strength=1.25, guidance=8.0,
         )
         self.assertIn('--prompt "$LORA_PROMPT"', cmd)
+        # The knobs that decide whether the LoRA is actually visible in the
+        # result. Missing --network_mul means kohya's polite 1.0 default, which
+        # is what "it is not sticking to the LoRA" looks like.
+        self.assertIn("--network_mul 1.25", cmd)
+        self.assertIn("--scale 8.0", cmd)
 
     def test_punctuation_survives(self):
         # Quotes used to be stripped because they broke the shell. They no
