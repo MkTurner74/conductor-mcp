@@ -127,6 +127,20 @@ WORKBENCH_COLLECTION = "AI Workbench"
 LORA_MODELS_COLLECTION = "LoRA Models"
 LORA_OUTPUT_COLLECTION = "LoRA Output"
 
+# Transcode profile requested when media is attached.
+#
+# Cantemo's import takes `tags` -- "a comma-separated list of transcode profile
+# names to transcode". We were passing none, so nothing was transcoded, and
+# because the POSTER is produced by the transcode, generated images landed with
+# real 1024x1024 PNG media and NO thumbnail: a wall of grey placeholders in the
+# grid, for assets that were perfectly sound.
+#
+# `lowres` is the profile this Portal actually uses -- a real broadcast asset
+# (VX-1717) carries shapes `original` (MXF) and `lowres` (MP4), so the name is
+# read off the live system rather than guessed. Configurable because it is a
+# per-Portal name and the next MAM will call it something else.
+TRANSCODE_TAGS = os.getenv("CANTEMO_TRANSCODE_TAGS", "lowres")
+
 # Job states as they appear on the Cantemo item, so the whole round trip can be
 # watched from the MAM without anyone opening Conductor's dashboard.
 STATUS_SUBMITTED = "submitted"
@@ -1376,7 +1390,8 @@ async def ingest_generated_images(
         item_id = item.get("id") or item.get("item_id") or (item.get("object") or {}).get("id")
         if not item_id:
             continue
-        await cantemo.import_uri(item_id, url, notranscode=False)
+        # Ask for a proxy, which is what makes Cantemo generate the poster.
+        await cantemo.import_uri(item_id, url, notranscode=False, tags=TRANSCODE_TAGS or None)
         # Everything needed to answer "what made this, from what, and who asked"
         # WITHOUT leaving the asset: the base model, the LoRA by name, its
         # trigger word, the full prompt, the person, and the compute job.
