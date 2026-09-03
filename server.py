@@ -18,6 +18,7 @@ import conductor_client as conductor
 import conductor_render
 import lora_pipeline
 import submissions
+import button_api
 
 # Stateless mode (no in-memory MCP sessions) is required on serverless hosts
 # (Vercel) where each request may hit a fresh instance. Local uvicorn keeps
@@ -58,8 +59,16 @@ class BearerAuthMiddleware:
 
 
 def build_app():
-    """ASGI app with optional bearer auth — used by uvicorn and the Vercel entry."""
+    """ASGI app with optional bearer auth — used by uvicorn and the Vercel entry.
+
+    Mounts the plain-REST button routes (button_api.py) alongside the MCP
+    transport, same app, same bearer auth — the Cantemo plugin's Django
+    backend is a fixed-flow caller, not an MCP client, so it hits
+    /lora/train and /lora/status/{id} directly instead of speaking
+    MCP JSON-RPC for a sequence that never varies.
+    """
     app = mcp.streamable_http_app()
+    app.router.routes.extend(button_api.routes)
     token = os.getenv("MCP_AUTH_TOKEN", "").strip()
     return BearerAuthMiddleware(app, token) if token else app
 
