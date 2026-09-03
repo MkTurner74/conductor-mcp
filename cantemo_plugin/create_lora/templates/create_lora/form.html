@@ -1,0 +1,16 @@
+<!-- Rendered inside the dialog opened by search_page_javascript.html. -->
+<p>Training a LoRA from <strong>{{ item_count }}</strong> selected item{{ item_count|pluralize }}.</p>
+
+<form id="create_lora_form" action="{{ submit_link }}">
+    <p>
+        <label for="id_label">Name</label><br/>
+        <input type="text" id="id_label" name="label" placeholder="e.g. Aston Martin F1 -- Livery v1" style="width: 100%;" required/>
+    </p>
+    <p>
+        <label for="id_trigger_word">Trigger word</label><br/>
+        <input type="text" id="id_trigger_word" name="trigger_word" value="sks" style="width: 100%;"/>
+    </p>
+    <p>
+        <button type="button" id="create_lora_submit_button">Create LoRA</button>
+    </p>
+</form>

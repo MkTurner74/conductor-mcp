@@ -1,0 +1,61 @@
+<!-- Defines the handler the menu item's onclick calls. Same dialog pattern -->
+<!-- Cantemo's own SearchPageExportExample uses for its "Export CSV" action. -->
+<script>
+    function openCreateLoraDialog(event) {
+        event.preventDefault();
+
+        var standardOptions = {
+            width: 480,
+            modal: true,
+            resizable: false,
+            dialogClass: 'myDialogClass',
+            title: gettext('Create LoRA'),
+            show: {effect: "fade", duration: 300},
+            hide: {effect: "fade", duration: 300},
+            buttons: [{
+                text: 'Close',
+                click: function () {
+                    $('.ui-dialog-content').dialog('close');
+                },
+                class: 'cancel-create-lora-button ui-dialog-button-cancel'
+            }]
+        };
+
+        $dialogEl = $('<div></div>');
+        // Load the form. Selection travels as query params -- see
+        // https://doc.cantemo.com/latest/DevelopmentGuide/modules/search_results.html
+        $dialogEl.load(
+            '/create_lora/?' + cntmo.app.page.searchresults.getQueryString(),
+            function () {
+                $dialogEl.dialog(standardOptions);
+
+                $dialogEl.find('#create_lora_submit_button').on('click', function (e) {
+                    e.preventDefault();
+                    var $form = $dialogEl.find('#create_lora_form');
+                    $.ajax({
+                        url: $form.attr('action'),
+                        method: 'POST',
+                        data: $form.serialize(),
+                        headers: {'X-CSRFToken': $.cookie ? $.cookie('csrftoken') : undefined},
+                        success: function (data) {
+                            $.growl(
+                                gettext('LoRA training started -- item ') + data.item_id +
+                                gettext(' created in Cantemo, job ') + data.job_id,
+                                'success'
+                            );
+                            $dialogEl.dialog('close');
+                        },
+                        error: function (xhr) {
+                            var msg = gettext('Could not start training.');
+                            try {
+                                msg += ' ' + (JSON.parse(xhr.responseText).error || '');
+                            } catch (e) {
+                            }
+                            $.growl(msg, 'error');
+                        }
+                    });
+                });
+            }
+        );
+    }
+</script>
