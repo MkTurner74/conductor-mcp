@@ -124,7 +124,113 @@ async def lora_status(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+async def lora_infer(request: Request) -> JSONResponse:
+    """
+    POST /lora/infer
+    Body: {lora_item_id: str, prompt: str, model?, count?, steps?, seed?, strength?, guidance?}
+
+    Submits the real inference job (not a dry run). Unlike training, no MAM
+    placeholder item is created here -- the outputs are brand-new images with
+    no id to hold until the job finishes, so the plugin polls by job_id via
+    /lora/infer/status/{job_id} instead of an item_id.
+    """
+    body = await _read_json(request)
+    lora_item_id = body.get("lora_item_id")
+    prompt = body.get("prompt")
+    if not lora_item_id or not prompt:
+        return JSONResponse({"error": "lora_item_id and prompt are required"}, status_code=400)
+
+    model = body.get("model", _DEFAULT_MODEL)
+    count = int(body.get("count", 4))
+    steps = int(body.get("steps", 30))
+    seed = int(body.get("seed", 42))
+    strength = float(body.get("strength", 1.0))
+    guidance = float(body.get("guidance", 7.5))
+
+    workdir = os.path.join(lora_pipeline.default_workdir(), "infer", lora_item_id)
+
+    try:
+        submit_result = await lora_pipeline.submit_inference(
+            dry_run=False,
+            lora_item_id=lora_item_id,
+            prompt=prompt,
+            workdir=workdir,
+            model=model,
+            count=count,
+            steps=steps,
+            seed=seed,
+            strength=strength,
+            guidance=guidance,
+        )
+        job_id = submit_result.get("jid")
+        if not job_id:
+            return JSONResponse(
+                {"error": "Conductor submission returned no job id", "detail": submit_result},
+                status_code=502,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "lora_item_id": lora_item_id,
+            "prompt": prompt,
+            "model": model,
+            "submit": submit_result,
+        }
+    )
+
+
+async def lora_infer_status(request: Request) -> JSONResponse:
+    """
+    GET /lora/infer/status/{job_id}?lora_item_id=...&prompt=...&model=...
+
+    One-shot status check, meant to be polled client-side -- same pattern as
+    /lora/status, but keyed on job_id rather than item_id since inference has
+    no MAM item until it lands. On the transition to success this calls
+    ingest_generated_images once, which creates the generated-image items,
+    their provenance, and the generated_with_lora relation edges.
+    """
+    job_id = request.path_params["job_id"]
+    lora_item_id = request.query_params.get("lora_item_id")
+    prompt = request.query_params.get("prompt")
+    model = request.query_params.get("model", _DEFAULT_MODEL)
+    if not lora_item_id or not prompt:
+        return JSONResponse({"error": "lora_item_id and prompt query params are required"}, status_code=400)
+
+    try:
+        status = await lora_pipeline.job_status(job_id)
+        raw = str(status.get("status") or "").lower()
+
+        if raw in ("success", "complete", "completed"):
+            finalized = await lora_pipeline.ingest_generated_images(
+                job_id=job_id,
+                lora_item_id=lora_item_id,
+                prompt=prompt,
+                base_model=f"{model}1-kohya",
+                created_by="Cantemo Portal button",
+            )
+            return JSONResponse(
+                {
+                    "job_id": job_id,
+                    "conductor_status": status.get("status"),
+                    "state": "ready" if finalized.get("ok") else "failed",
+                    "finalized": finalized,
+                }
+            )
+
+        if raw in ("failed", "killed"):
+            return JSONResponse({"job_id": job_id, "conductor_status": status.get("status"), "state": "failed"})
+
+        return JSONResponse({"job_id": job_id, "conductor_status": status.get("status"), "state": "running"})
+    except Exception as exc:
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+
 routes = [
     Route("/lora/train", lora_train, methods=["POST"]),
     Route("/lora/status/{item_id}", lora_status, methods=["GET"]),
+    Route("/lora/infer", lora_infer, methods=["POST"]),
+    Route("/lora/infer/status/{job_id}", lora_infer_status, methods=["GET"]),
 ]
