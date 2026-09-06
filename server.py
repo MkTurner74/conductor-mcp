@@ -699,6 +699,35 @@ async def ingest_generated_to_mam(
 
 
 @mcp.tool()
+async def ingest_deliverable_to_mam(
+    source_url: Annotated[str, Field(description="Signed/public URL of the finished deliverable to land in the MAM — a Botverse transcode/conform output, a Conductor render, or any media Cantemo can import")],
+    title: Annotated[str, Field(description="Human title for the new Cantemo item")],
+) -> str:
+    """
+    Land an arbitrary finished deliverable back in the Cantemo MAM as a new
+    item, returning its item_id.
+
+    The generic counterpart to ingest_generated_to_mam, which is tied to the
+    LoRA inference pipeline specifically (job_id, lora_item_id, prompt) — use
+    this one for anything with no LoRA generation provenance to record: a
+    conformed archive-to-air master, a re-encode, a render. File the
+    resulting item_id into a collection with a following
+    cantemo_add_to_collection step.
+    """
+    if err := _cantemo_guard():
+        return err
+    try:
+        item = await cantemo.create_placeholder(title=title)
+        item_id = item.get("id") or item.get("item_id") or (item.get("object") or {}).get("id")
+        if not item_id:
+            return json.dumps({"ok": False, "error": "Cantemo did not return an item id for the new placeholder", "raw": item}, indent=2, default=str)
+        await cantemo.import_uri(item_id, source_url, notranscode=False)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+    return json.dumps({"ok": True, "item_id": item_id, "item_ids": [item_id]}, indent=2, default=str)
+
+
+@mcp.tool()
 async def cantemo_provenance_plan() -> str:
     """
     Check whether the "AI Provenance" metadata group exists on the Portal, and
