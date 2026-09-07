@@ -724,7 +724,14 @@ async def ingest_deliverable_to_mam(
         await cantemo.import_uri(item_id, source_url, notranscode=False)
     except Exception as exc:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
-    return json.dumps({"ok": True, "item_id": item_id, "item_ids": [item_id]}, indent=2, default=str)
+    # "items", not "item_ids" — the engine's generic Cantemo-call response
+    # parser (owg-core's beginCantemoCall/runCantemoCall) reads res.items to
+    # publish the chained item_ids/source_item_ids values a following
+    # cantemo_add_to_collection step needs; it doesn't look for item_ids in
+    # the response (that name is for the CALLER's input, not the tool's
+    # output — collides with itself here). Match the sibling Cantemo tools'
+    # convention (cantemo_search_assets, cantemo_collection_items) exactly.
+    return json.dumps({"ok": True, "item_id": item_id, "items": [item_id]}, indent=2, default=str)
 
 
 @mcp.tool()
