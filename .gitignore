@@ -10,3 +10,4 @@ build/
 *.egg-info/
 
 .vercel
+conductor-ai-probe-report.md

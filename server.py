@@ -14,6 +14,8 @@ from pydantic import Field
 import asyncio
 
 import cantemo_client as cantemo
+import conductor_ai_client
+import conductor_ai_pipeline
 import conductor_client as conductor
 import conductor_render
 import lora_pipeline
@@ -761,6 +763,215 @@ async def kohya_package_info(
         return json.dumps(await lora_pipeline.resolve_packages(model), indent=2, default=str)
     except Exception as exc:
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2)
+
+
+# ── Conductor for AI ────────────────────────────────────────────────────────
+# A separate Conductor product with its own key, host and resource model. These
+# tools sit alongside the kohya-render-job tools above rather than replacing
+# them: that path is proven and frozen for IBC, this one is faster but unproven
+# until a real generation has run through it.
+
+
+def _ai_guard() -> Optional[str]:
+    if not conductor_ai_client.configured():
+        return json.dumps({
+            "error": "Conductor for AI is not configured — set CONDUCTOR_AI_API_KEY. "
+                     "It needs its own key; the render API's service-account key returns 401 here.",
+        }, indent=2)
+    return None
+
+
+def _ai_error(exc: Exception) -> str:
+    """Keep the server's own message. A bare status code sent an earlier debug
+    session down the wrong path for three jobs."""
+    body = getattr(exc, "body", "")
+    out: dict = {"error": f"{type(exc).__name__}: {exc}"}
+    if body:
+        out["response_body"] = body[:1000]
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
+async def ai_project_info() -> str:
+    """
+    Confirm the Conductor for AI connection: which project this server is
+    pointed at and which base models it can generate with. Read-only and free —
+    the first thing to run after a new API key is set.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        listing = await conductor_ai_pipeline.list_models()
+        project = await conductor_ai_client.get_project(listing["project_id"])
+        return json.dumps({"project": project, **listing}, indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_list_base_models() -> str:
+    """
+    List the base models registered in the Conductor for AI project — the
+    model_id every generation and training has to name. Read-only.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        return json.dumps(await conductor_ai_pipeline.list_models(), indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_list_loras(
+    base_model: Annotated[str, Field(description="Base model id, name or family (e.g. sdxl). Blank uses the first registered model")] = "",
+) -> str:
+    """
+    List the LoRAs Conductor for AI can generate with, for one base model.
+
+    NOT the same list as cantemo_list_loras: that is what the MAM holds, this is
+    what this API can address. A LoRA trained through the older kohya path lives
+    in the MAM as a file and does not appear here until it has been trained
+    through — or registered with — this API.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        return json.dumps(await conductor_ai_pipeline.list_available_loras(base_model), indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_generate_images(
+    prompt: Annotated[str, Field(description="What to generate. If a LoRA is selected, include its trigger word or the trained look will not appear")],
+    base_model: Annotated[str, Field(description="Base model id, name or family (e.g. sdxl). Blank uses the first registered model")] = "",
+    lora_id: Annotated[str, Field(description="Optional Conductor for AI LoRA id to generate with (from ai_list_loras). Leave blank for a plain base-model generation")] = "",
+    trigger_word: Annotated[str, Field(description="The LoRA's trigger word, when one is selected")] = "",
+    weight: Annotated[float, Field(description="How hard the LoRA pulls. 1.0 default; 1.2-1.3 when the trained look is not coming through")] = 1.0,
+    steps: Annotated[int, Field(description="Sampling steps. 5-50 (the models cap at 50). Default 30")] = 30,
+    seed: Annotated[int, Field(description="Random seed. Default 42")] = 42,
+    width: Annotated[int, Field(description="Image width in pixels. 384-1792 (SDXL) or 400-1808 (FLUX/SD3). Default 1024")] = 1024,
+    height: Annotated[int, Field(description="Image height in pixels. 384-1792 (SDXL) or 400-1808 (FLUX/SD3). Default 1024")] = 1024,
+    prompt_adherence: Annotated[float, Field(description="How closely the image follows the prompt. This API uses a 1-4 scale (default 3) — NOT the 7.5+ guidance number the kohya inference tool takes. 4 is the tightest")] = 3.0,
+    name: Annotated[str, Field(description="Optional label for the generation, shown in Conductor's dashboard")] = "",
+    gpu_type: Annotated[str, Field(description="Optional GPU type override. Blank lets Conductor choose")] = "",
+    gpu_count: Annotated[int, Field(description="Optional GPU count. 0 lets Conductor choose")] = 0,
+) -> str:
+    """
+    Generate images on Conductor for AI, against a model that is already
+    resident — no weights upload and no per-job cold start.
+
+    Returns an inference id immediately; poll it with ai_generation_status and
+    collect the images with ai_generation_outputs. THIS SPENDS GPU TIME.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        result = await conductor_ai_pipeline.submit_generation(
+            prompt=prompt, model=base_model, lora_id=lora_id, trigger_word=trigger_word,
+            weight=weight, steps=steps, seed=seed, width=width, height=height,
+            prompt_adherence=prompt_adherence, name=name,
+            gpu_type=gpu_type, gpu_count=gpu_count,
+        )
+        return json.dumps(result, indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_generation_status(
+    inference_id: Annotated[str, Field(description="The id returned by ai_generate_images")],
+) -> str:
+    """
+    How a Conductor for AI generation is getting on, with the cost it has run up
+    so far. `state` is success / failed / running; `status` is the service's own
+    word for it, kept raw so an unfamiliar one is visible rather than assumed.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        return json.dumps(await conductor_ai_pipeline.generation_status(inference_id), indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_generation_outputs(
+    inference_id: Annotated[str, Field(description="The id returned by ai_generate_images")],
+) -> str:
+    """
+    The generated images as directly fetchable URLs. Read-only.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        return json.dumps(await conductor_ai_pipeline.generation_images(inference_id), indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ingest_ai_generated_to_mam(
+    inference_id: Annotated[str, Field(description="Conductor for AI inference id whose images should land in the MAM")],
+    prompt: Annotated[str, Field(description="The prompt used — recorded on every generated item")],
+    lora_item_id: Annotated[str, Field(description="Optional Cantemo item id of the LoRA used, when there was one — adds the provenance relation edge")] = "",
+    base_model: Annotated[str, Field(description="Base model name to record on each image")] = "",
+    created_by: Annotated[str, Field(description="Who ran the generation")] = "NearlyMe",
+    collection: Annotated[str, Field(description='Collection to file the images into, nested under "AI Workbench". Created if absent')] = "LoRA Output",
+) -> str:
+    """
+    Land Conductor for AI output in the Cantemo MAM, each image carrying its
+    prompt, model and — when a LoRA was used — a relation edge back to it.
+
+    The Conductor for AI counterpart of ingest_generated_to_mam, which reads
+    from the render-job system instead.
+    """
+    if err := _cantemo_guard():
+        return err
+    if err := _ai_guard():
+        return err
+    try:
+        result = await conductor_ai_pipeline.ingest_generated_images(
+            inference_id=inference_id, prompt=prompt, lora_item_id=lora_item_id,
+            base_model=base_model, created_by=created_by, collection=collection or None,
+        )
+        return json.dumps(result, indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_training_status(
+    training_id: Annotated[str, Field(description="The id of a Conductor for AI LoRA training")],
+) -> str:
+    """
+    How a Conductor for AI LoRA training is getting on, including how many
+    epochs are done and what it has cost. Read-only.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        return json.dumps(await conductor_ai_pipeline.training_status(training_id), indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
+async def ai_training_epochs(
+    training_id: Annotated[str, Field(description="The id of a Conductor for AI LoRA training")],
+) -> str:
+    """
+    Every checkpoint a training has produced so far, with the sample image each
+    epoch rendered — so the best epoch can be chosen rather than just the last.
+    Read-only.
+    """
+    if err := _ai_guard():
+        return err
+    try:
+        return json.dumps(await conductor_ai_pipeline.training_epochs(training_id), indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
 
 
 if __name__ == "__main__":
