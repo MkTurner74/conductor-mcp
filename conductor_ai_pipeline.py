@@ -15,11 +15,11 @@ turns out to be wrong about the API, deleting it costs nothing.
 
 Two things are NOT assumed here, because the OpenAPI document does not say:
 
-  * the status vocabulary — TERMINAL_OK / TERMINAL_BAD below are a superset of
-    the plausible spellings, and anything unrecognised is treated as "still
-    running" rather than silently passing as success. A job that lies about
-    finishing is the expensive failure (see the Conductor green-job lesson);
-    a job that takes one extra poll is free.
+  * the status vocabulary — now confirmed for the happy path (created, pending,
+    running, completed) but still a superset below, because anything
+    unrecognised is treated as "still running" rather than silently passing as
+    success. A job that lies about finishing is the expensive failure (see the
+    Conductor green-job lesson); a job that takes one extra poll is free.
   * whether a MAM-held .safetensors can be used here at all. This API generates
     with LoRAs IT holds (lora_details[].id is one of its own lora-models). A
     LoRA trained through the old kohya path lives in Cantemo as a file and is
@@ -39,8 +39,10 @@ import lora_pipeline
 
 _logger = logging.getLogger(__name__)
 
-# Status spellings. Unconfirmed against a live job — run_ai_probe.py records
-# what really comes back, and whatever it finds should be folded in here.
+# Status spellings. CONFIRMED against inference 00010 (2026-09-08), which ran
+# created -> pending -> running -> completed in 34 seconds. The rest are kept
+# because this is an Open Beta and the vocabulary can grow; anything NOT listed
+# reads as still-running, never as success.
 TERMINAL_OK = {"success", "succeeded", "completed", "complete", "finished", "done"}
 TERMINAL_BAD = {"failed", "failure", "error", "errored", "canceled", "cancelled",
                 "killed", "terminated", "aborted", "timeout", "timed_out"}
