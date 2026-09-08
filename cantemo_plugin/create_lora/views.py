@@ -27,7 +27,15 @@ log = logging.getLogger(__name__)
 
 # Set on the portal-web.service environment (systemd unit override) --
 # never hardcoded, never committed.
-CONDUCTOR_API_URL = os.environ.get("CONDUCTOR_API_URL", "https://web-production-c671d.up.railway.app")
+#
+# The default below is deliberately the REAL, currently-deployed
+# conductor-mcp domain, not a placeholder: web-production-c671d.up.railway.app
+# (the old default) isn't even a domain attached to the conductor-mcp
+# Railway service any more (confirmed via `railway domain` 2026-09-07) --
+# an install that forgot to override it would have silently pointed at
+# nothing. Still override it explicitly in the systemd unit; a wrong-but-
+# present default is a safety net, not permission to skip that step.
+CONDUCTOR_API_URL = os.environ.get("CONDUCTOR_API_URL", "https://conductor-mcp-production.up.railway.app")
 CONDUCTOR_API_TOKEN = os.environ.get("CONDUCTOR_API_TOKEN", "")
 
 
