@@ -234,5 +234,27 @@ class AuthConfigTests(unittest.TestCase):
         self.assertIn("CONDUCTOR_AI_API_KEY", str(ctx.exception))
 
 
+class DatasetCreationTests(unittest.TestCase):
+    """Confirmed 2026-09-09 via --dataset-probe: asset_ids is required, not
+    optional — there is no create-empty-then-attach path. A regression here
+    would silently reintroduce the 400 the probe already paid to discover."""
+
+    def test_empty_asset_ids_refused_before_the_call(self):
+        with self.assertRaises(ValueError):
+            run(ai.create_dataset("proj-1", asset_ids=[]))
+
+    def test_body_carries_name_and_asset_ids(self):
+        captured = {}
+
+        async def fake_request(method, path, *, params=None, json_body=None, timeout=60.0):
+            captured["method"], captured["path"], captured["body"] = method, path, json_body
+            return {"id": "ds-1"}
+
+        with mock.patch.object(ai, "_request", fake_request):
+            run(ai.create_dataset("proj-1", asset_ids=["a1", "a2"], name="my-set"))
+        self.assertEqual(captured["path"], "/core/v1/projects/proj-1/assets/dataset")
+        self.assertEqual(captured["body"], {"name": "my-set", "asset_ids": ["a1", "a2"]})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

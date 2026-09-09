@@ -220,18 +220,19 @@ async def list_datasets(project_id: str, limit: int = 100) -> Any:
                           params={"limit": limit})
 
 
-async def create_dataset(project_id: str, name: str = "", asset_ids: Optional[list[str]] = None) -> Any:
+async def create_dataset(project_id: str, asset_ids: list[str], name: str = "") -> Any:
     """Create a dataset.
 
-    NOTE: the OpenAPI document declares NO request body for this path (a
-    swagger-annotation gap — the 201 response carries {id, name, asset_ids}).
-    The body sent here is the shape the response implies. If it comes back 400,
-    run_ai_probe.py prints the server's own message, which is the fastest route
-    to the real shape.
+    CONFIRMED 2026-09-09 via run_ai_probe.py --dataset-probe: `asset_ids` is
+    REQUIRED (server: "Field validation for 'AssetIDs' failed on the
+    'required' tag"). There is no create-empty-then-attach two-step — the
+    assets have to exist (via sign_uploads + complete_multipart) before this
+    call, and their ids go in the same POST that creates the dataset.
     """
-    body: dict = {"name": name}
-    if asset_ids:
-        body["asset_ids"] = asset_ids
+    if not asset_ids:
+        raise ValueError("create_dataset needs at least one asset_id — upload the images first "
+                         "(sign_uploads + complete_multipart), there is no empty-dataset-then-attach path.")
+    body: dict = {"name": name, "asset_ids": asset_ids}
     return await _request("POST", f"/core/v1/projects/{project_id}/assets/dataset", json_body=body)
 
 

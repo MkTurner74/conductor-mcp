@@ -942,6 +942,46 @@ async def ingest_ai_generated_to_mam(
 
 
 @mcp.tool()
+async def ai_train_lora(
+    item_ids: Annotated[list[str], Field(description="Cantemo item ids to train on — get these from cantemo_search_assets")],
+    label: Annotated[str, Field(description='Human-readable name, e.g. "Aston Martin F1 — Livery v1"')],
+    trigger_word: Annotated[str, Field(description="Token that invokes the trained concept in prompts. Default 'sks'")] = "sks",
+    model: Annotated[str, Field(description="Base model id, name or family (e.g. sdxl). Blank uses the first registered model")] = "",
+    epochs: Annotated[int, Field(description="Training epochs. Default 10")] = 10,
+    dry_run: Annotated[bool, Field(description="True (default) uploads the dataset but stops before submitting the training job, which is the GPU-minutes spend. Set false only on explicit instruction")] = True,
+) -> str:
+    """
+    Train a LoRA through Conductor for AI, from assets selected in the Cantemo MAM.
+
+    The ai_* twin of submit_lora_training: same Cantemo item_ids in, a trained
+    LoRA out, but through this API's own training endpoint instead of a kohya
+    bash script inside a render job. This is the ONLY way a LoRA gets onto
+    Conductor for AI — there is no endpoint to upload an already-trained
+    .safetensors directly, only GET on lora-models. So this retrains from the
+    source images, it does not port existing weights.
+
+    DEFAULTS TO A DRY RUN: the dataset upload itself runs (so its cost and any
+    skipped images are visible) but the training job is not submitted. Only
+    pass dry_run=false when explicitly told to — a real submission spends
+    GPU money on Mark's Conductor account.
+
+    Non-image items in the selection are skipped and reported, not fatal.
+    """
+    if err := _cantemo_guard():
+        return err
+    if err := _ai_guard():
+        return err
+    try:
+        result = await conductor_ai_pipeline.submit_training_from_cantemo(
+            item_ids=item_ids, label=label, trigger_word=trigger_word,
+            model=model, epochs=epochs, dry_run=dry_run,
+        )
+        return json.dumps(result, indent=2, default=str)
+    except Exception as exc:
+        return _ai_error(exc)
+
+
+@mcp.tool()
 async def ai_training_status(
     training_id: Annotated[str, Field(description="The id of a Conductor for AI LoRA training")],
 ) -> str:

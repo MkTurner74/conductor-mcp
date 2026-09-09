@@ -29,9 +29,12 @@ Two things are NOT assumed here, because the OpenAPI document does not say:
     an OPTIONAL LoRA rather than requiring one.
 """
 
+import hashlib
 import logging
 import os
 from typing import Any, Optional
+
+import httpx
 
 import cantemo_client as cantemo
 import conductor_ai_client as ai
@@ -401,6 +404,154 @@ async def ingest_generated_images(
         "lora": {"item_id": lora_item_id, **identity} if lora_item_id else None,
         "provenance_skipped": skipped_report,
     }
+
+
+# --- training dataset upload ------------------------------------------------
+# Closes the gap noted at the top of this file: a LoRA trained through the old
+# kohya path lives in Cantemo as a .safetensors and this API cannot address it
+# directly (no POST for pre-trained weights — only GET on lora-models). The
+# only door in is retraining through this API's own pipeline: pull the same
+# source images back out of Cantemo, upload them here, then train. That is a
+# real GPU-minutes cost, not a file copy — worth knowing before assuming
+# "upload the LoRA" is cheap.
+
+def _md5(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _upload_one_file(pid: str, local_path: str) -> str:
+    """Presign, PUT every part, complete the multipart upload. Returns the asset_id."""
+    size = os.path.getsize(local_path)
+    hash_ = _md5(local_path)
+    ext = os.path.splitext(local_path)[1].lower()
+    file_name = os.path.basename(local_path)
+    # CONFIRMED 2026-09-09: signing with the real image mime type (image/png)
+    # produces a presigned PUT URL that S3 itself then rejects with
+    # SignatureDoesNotMatch — application/octet-stream signs and PUTs clean.
+    # The server evidently determines the real type from file_extension, not
+    # this field, so there is no reason to fight it.
+    mime_type = "application/octet-stream"
+    signed = await ai.sign_uploads(pid, files=[{
+        "file_name": file_name,
+        "file_path": f"/{file_name}",
+        "file_extension": ext,
+        "mime_type": mime_type,
+        "size": size,
+        "hash": hash_,
+    }], cloud="cw")
+    rows = signed if isinstance(signed, list) else (signed or {}).get("data") or []
+    if not rows:
+        raise ai.ConductorAIError("POST", "/sign/uploads", 0, f"No upload ticket returned for {file_name}")
+    row = rows[0]
+    asset_id = str(row.get("asset_id") or "")
+    s3_upload_id = str(row.get("s3_upload_id") or "")
+    parts = row.get("parts") or []
+    with open(local_path, "rb") as f:
+        data = f.read()
+    part_size = int(row.get("part_size") or len(data))
+    completed: list[dict] = []
+    # The presigned URL's signature covers Content-Type (SignedHeaders includes
+    # it) — the PUT has to send the SAME mime_type given to sign_uploads or S3
+    # rejects it with a bare 403, no message.
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for part in parts:
+            num = int(part.get("part_number") or 1)
+            url = part.get("url")
+            start = (num - 1) * part_size
+            chunk = data[start:start + part_size]
+            resp = await client.put(url, content=chunk, headers={"Content-Type": mime_type})
+            resp.raise_for_status()
+            completed.append({"part_number": num, "etag": resp.headers.get("ETag", "").strip('"')})
+    # A small file signs as ONE part with s3_upload_id "" (confirmed 2026-09-09)
+    # — that PUT already finished the object; there is no multipart session to
+    # close, and calling complete_multipart with an empty id is a 400 waiting
+    # to happen. Only real multipart uploads (a real s3_upload_id) need this.
+    if s3_upload_id:
+        await ai.complete_multipart(pid, s3_upload_id, hash_, completed, cloud="cw")
+    return asset_id
+
+
+async def upload_and_create_dataset(item_ids: list[str], name: str, workdir: str) -> dict:
+    """
+    Pull Cantemo items down and upload them into Conductor for AI as a dataset.
+
+    Reuses lora_pipeline.stage_training_images for the Cantemo half — same
+    retry-3x-before-skipping behaviour, so a flaky download does not silently
+    shrink the training set here either (see job 00012 in lora_pipeline.py).
+    The upload half is this API's own presign-and-PUT; no ciocore involved.
+
+    create_dataset requires at least one asset_id (confirmed 2026-09-09) —
+    there is no create-empty-then-attach path, so this always uploads first.
+    """
+    pid = await project_id()
+    staged = await lora_pipeline.stage_training_images(
+        item_ids, workdir=workdir, trigger_word="dataset", class_word="images", repeats=1)
+    files = staged["files"]
+    if not files:
+        return {"ok": False, "error": "No trainable images among the selected items.", "skipped": staged["skipped"]}
+
+    asset_ids: list[str] = []
+    upload_skipped: list[dict] = []
+    for path in files:
+        try:
+            asset_ids.append(await _upload_one_file(pid, path))
+        except Exception as exc:
+            upload_skipped.append({"file": path, "reason": f"{type(exc).__name__}: {exc}"})
+
+    if not asset_ids:
+        return {"ok": False, "error": "Every upload failed.", "upload_skipped": upload_skipped}
+
+    dataset = await ai.create_dataset(pid, asset_ids=asset_ids, name=name)
+    return {
+        "ok": True,
+        "project_id": pid,
+        "dataset_id": str((dataset or {}).get("id") or ""),
+        "asset_ids": asset_ids,
+        "count": len(asset_ids),
+        "cantemo_skipped": staged["skipped"],
+        "upload_skipped": upload_skipped,
+    }
+
+
+async def submit_training_from_cantemo(
+    item_ids: list[str],
+    label: str,
+    trigger_word: str = "sks",
+    model: str = "",
+    epochs: int = 10,
+    dry_run: bool = True,
+) -> dict:
+    """
+    The AI-API twin of lora_pipeline.submit_training: same Cantemo item_ids in,
+    a trained LoRA out — but through Conductor for AI's own training endpoint
+    (upload -> dataset -> lora-trainings) instead of a kohya bash script inside
+    a render job.
+
+    DEFAULTS TO A DRY RUN: uploads the dataset (so the upload path itself is
+    exercised and its real cost is visible) but stops before POST
+    /lora-trainings, which is the GPU-minutes spend. Pass dry_run=False only
+    when explicitly told to.
+    """
+    model_id = await resolve_model_id(model)
+    workdir = os.path.join(lora_pipeline.default_workdir(),
+                           "".join(ch if ch.isalnum() else "-" for ch in label).strip("-").lower())
+    dataset_name = f"{label} training set"
+    staged = await upload_and_create_dataset(item_ids, dataset_name, workdir)
+    if not staged.get("ok"):
+        return staged
+
+    if dry_run:
+        return {**staged, "dry_run": True, "would_train_against": model_id,
+                "note": "Dataset uploaded, no training job submitted. Pass dry_run=False to spend GPU time."}
+
+    trained = await submit_lora_training(
+        dataset_id=staged["dataset_id"], lora_name=label, model=model,
+        trigger_word=trigger_word, num_epochs=epochs)
+    return {**staged, "dry_run": False, **trained}
 
 
 # --- training (client-complete, not yet proven) -----------------------------
