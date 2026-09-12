@@ -38,26 +38,44 @@ def base_url() -> str:
 
 
 def configured() -> bool:
-    return bool(base_url() and os.getenv("CANTEMO_API_TOKEN"))
+    if not base_url():
+        return False
+    return bool(os.getenv("CANTEMO_API_TOKEN")) or bool(
+        os.getenv("CANTEMO_USER") and os.getenv("CANTEMO_PASSWORD"))
 
 
 def _headers(accept: str = "application/json") -> dict:
-    return {
-        "auth-token": os.getenv("CANTEMO_API_TOKEN", ""),
-        "Accept": accept,
-    }
+    headers = {"Accept": accept}
+    token = os.getenv("CANTEMO_API_TOKEN", "")
+    if token:
+        headers["auth-token"] = token
+    return headers
+
+
+def _auth() -> Optional[tuple[str, str]]:
+    """HTTP Basic against /API/v2/* -- confirmed working 2026-09-10 directly
+    against cantemo6.codemill.se, same as the Portal UI login. Falls back to
+    this only when no auth-token is minted (CANTEMO_API_TOKEN unset); the
+    token header is preferred when present since that is what every other
+    function here was written and proven against."""
+    if os.getenv("CANTEMO_API_TOKEN"):
+        return None
+    user, password = os.getenv("CANTEMO_USER", ""), os.getenv("CANTEMO_PASSWORD", "")
+    return (user, password) if user and password else None
 
 
 def _require() -> str:
     if not configured():
-        raise RuntimeError("Cantemo not configured -- set CANTEMO_URL and CANTEMO_API_TOKEN")
+        raise RuntimeError(
+            "Cantemo not configured -- set CANTEMO_URL and either CANTEMO_API_TOKEN "
+            "or CANTEMO_USER + CANTEMO_PASSWORD")
     return base_url()
 
 
 async def _request(method: str, path: str, **kw) -> Any:
     base = _require()
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.request(method, f"{base}{path}", headers=_headers(), **kw)
+        resp = await client.request(method, f"{base}{path}", headers=_headers(), auth=_auth(), **kw)
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return None

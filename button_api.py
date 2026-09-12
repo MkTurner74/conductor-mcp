@@ -19,6 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+import conductor_ai_pipeline as ai_pipeline
 import lora_pipeline
 
 _DEFAULT_MODEL = "sdxl"
@@ -228,9 +229,117 @@ async def lora_infer_status(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
 
+# --- Conductor for AI inference button (2026-09-12) -------------------------
+# Sibling of lora_infer/lora_infer_status above, NOT a replacement: those call
+# lora_pipeline (kohya, cold-starts a render job every time). These call
+# conductor_ai_pipeline (Conductor for AI's own resident-model API) — the
+# fast path, for a LoRA that was trained through that API rather than kohya.
+#
+# The two populations of LoRA item only overlap once something is trained
+# through both paths for the same subject, which is exactly today's case
+# (VX-4427 via kohya, VX-4553 via the AI API, same Aston Martin F1 source
+# images) — good enough to prove they can sit side by side without either
+# button needing to know the other exists.
+
+async def ai_lora_infer(request: Request) -> JSONResponse:
+    """
+    POST /lora/ai_infer
+    Body: {lora_item_id: str, prompt: str, base_model?, weight?, steps?,
+           seed?, width?, height?, prompt_adherence?}
+
+    lora_item_id is the ai_lora-tracked Cantemo item (created by
+    create_tracked_ai_lora_item at training-submit time, e.g. VX-4553) — NOT
+    a raw Conductor lora_id. The actual lora_id is resolved live from the
+    item's own provenance (training_id) via latest_lora_id(), so a job that
+    trains further epochs later just works without the item needing an edit.
+    """
+    body = await _read_json(request)
+    lora_item_id = body.get("lora_item_id")
+    prompt = body.get("prompt")
+    if not lora_item_id or not prompt:
+        return JSONResponse({"error": "lora_item_id and prompt are required"}, status_code=400)
+
+    try:
+        identity = await ai_pipeline.ai_lora_identity(lora_item_id)
+        if not identity["training_id"]:
+            return JSONResponse(
+                {"error": f"{lora_item_id} has no prov_job_id — is this an ai_lora-tracked item?"},
+                status_code=400)
+
+        lora_id = await ai_pipeline.latest_lora_id(identity["training_id"])
+
+        submit_result = await ai_pipeline.submit_generation(
+            prompt=prompt,
+            model=body.get("base_model", ""),
+            lora_id=lora_id,
+            trigger_word=identity["trigger_word"] or body.get("trigger_word", ""),
+            weight=float(body.get("weight", 1.0)),
+            steps=int(body.get("steps", 30)),
+            seed=int(body.get("seed", 42)),
+            width=int(body.get("width", 1024)),
+            height=int(body.get("height", 1024)),
+            prompt_adherence=float(body.get("prompt_adherence", 3.0)),
+            name="cantemo-portal-button",
+        )
+        if not submit_result.get("ok"):
+            return JSONResponse({"error": submit_result.get("error", "submission failed")}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+    return JSONResponse({
+        "job_id": submit_result["inference_id"],
+        "lora_item_id": lora_item_id,
+        "lora_id": lora_id,
+        "prompt": prompt,
+        "submit": submit_result,
+    })
+
+
+async def ai_lora_infer_status(request: Request) -> JSONResponse:
+    """
+    GET /lora/ai_infer/status/{job_id}?lora_item_id=...&prompt=...
+
+    Same one-shot-poll contract as lora_infer_status. On success, calls
+    conductor_ai_pipeline.ingest_generated_images once — that writes each
+    image into Cantemo with a generated_with relation back to lora_item_id.
+    """
+    job_id = request.path_params["job_id"]
+    lora_item_id = request.query_params.get("lora_item_id")
+    prompt = request.query_params.get("prompt")
+    if not lora_item_id or not prompt:
+        return JSONResponse({"error": "lora_item_id and prompt query params are required"}, status_code=400)
+
+    try:
+        status = await ai_pipeline.generation_status(job_id)
+
+        if status["state"] == "success":
+            finalized = await ai_pipeline.ingest_generated_images(
+                inference_id=job_id,
+                prompt=prompt,
+                lora_item_id=lora_item_id,
+                base_model="conductor-for-ai",
+                created_by="Cantemo Portal button",
+            )
+            return JSONResponse({
+                "job_id": job_id,
+                "conductor_status": status["status"],
+                "state": "ready" if finalized.get("ok") else "failed",
+                "finalized": finalized,
+            })
+
+        if status["state"] == "failed":
+            return JSONResponse({"job_id": job_id, "conductor_status": status["status"], "state": "failed"})
+
+        return JSONResponse({"job_id": job_id, "conductor_status": status["status"], "state": "running"})
+    except Exception as exc:
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+
 routes = [
     Route("/lora/train", lora_train, methods=["POST"]),
     Route("/lora/status/{item_id}", lora_status, methods=["GET"]),
     Route("/lora/infer", lora_infer, methods=["POST"]),
     Route("/lora/infer/status/{job_id}", lora_infer_status, methods=["GET"]),
+    Route("/lora/ai_infer", ai_lora_infer, methods=["POST"]),
+    Route("/lora/ai_infer/status/{job_id}", ai_lora_infer_status, methods=["GET"]),
 ]

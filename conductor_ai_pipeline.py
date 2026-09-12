@@ -324,6 +324,127 @@ async def generation_images(inference_id: str) -> dict:
 
 # --- MAM write-back --------------------------------------------------------
 
+async def create_tracked_ai_lora_item(
+    label: str,
+    training_id: str,
+    source_item_ids: list[str],
+    base_model: str,
+    trigger_word: str,
+    created_by: str,
+) -> dict:
+    """Create the LoRA's MAM item the moment training is submitted, mirroring
+    lora_pipeline.create_tracked_lora_item -- but for a LoRA trained through
+    THIS api, which never produces a Cantemo-held .safetensors to attach.
+
+    That is why there is no finalize_tracked_ai_lora() to go with this: the
+    kohya path's finalize step exists to download and attach weights once
+    training completes. Here the LoRA stays resident in Conductor for AI --
+    "finalize" is just flipping status to ready (sync_ai_lora_status_to_mam),
+    and inference resolves the current lora_id live off the item's job_id via
+    latest_lora_id() rather than a value cached on the item. One field, one
+    write, no attach step.
+
+    provenance_kind is "ai_lora" (not "lora") so the two training paths stay
+    visually distinguishable in the MAM without a metadata-schema change --
+    prov_kind is a free-text string field, not a fixed enum.
+    """
+    item = await cantemo.create_placeholder(title=f"LoRA (AI-API) -- {label}")
+    item_id = item.get("id") or item.get("item_id") or (item.get("object") or {}).get("id")
+    if not item_id:
+        return {"ok": False, "error": "Could not read new item id", "response": item}
+
+    tracked_fields, _ = await lora_pipeline._writable_provenance_fields(
+        {
+            "provenance_kind": "ai_lora",
+            "status": lora_pipeline.STATUS_SUBMITTED,
+            "label": label,
+            "base_model": base_model,
+            "trigger_word": trigger_word,
+            "job_id": training_id,
+            "source_asset_ids": ",".join(source_item_ids),
+        }
+    )
+    await cantemo.set_metadata(item_id, tracked_fields, group_name=lora_pipeline.PROVENANCE_GROUP)
+
+    linked, failed = [], []
+    for src in source_item_ids:
+        try:
+            await cantemo.create_relation(item_id, src, relation_type=lora_pipeline.REL_TRAINED_FROM)
+            linked.append(src)
+        except Exception as exc:
+            failed.append({"item_id": src, "error": str(exc)})
+
+    return {"ok": True, "item_id": item_id, "training_id": training_id, "related": linked,
+            "relation_failures": failed}
+
+
+async def ai_lora_identity(item_id: str) -> dict:
+    """Read an ai_lora item's own provenance back out of the MAM: label,
+    trigger word, and critically the training_id (prov_job_id) -- the button
+    only ever gets handed a Cantemo item id, and the training_id is what
+    latest_lora_id() and sync_ai_lora_status_to_mam() actually need.
+
+    Same nested-walk approach as lora_pipeline.lora_identity (the metadata
+    document nests differently by Portal version) rather than a refactor of
+    it, since that one only reads two fields and callers on the kohya path
+    should not have to change shape because this path added a third.
+    """
+    label, trigger, job_id = "", "", ""
+
+    def walk(node: Any) -> None:
+        nonlocal label, trigger, job_id
+        if isinstance(node, dict):
+            name, value = node.get("name"), node.get("value")
+            if value:
+                v = str(value if not isinstance(value, list) else value[0])
+                if name == "prov_label":
+                    label = v
+                elif name == "prov_trigger_word":
+                    trigger = v
+                elif name == "prov_job_id":
+                    job_id = v
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    try:
+        walk(await cantemo.get_metadata(item_id))
+    except Exception as exc:
+        _logger.error("[conductor-ai] could not read provenance of %s: %s", item_id, exc)
+
+    return {"item_id": item_id, "label": label, "trigger_word": trigger, "training_id": job_id}
+
+
+async def sync_ai_lora_status_to_mam(item_id: str, training_id: str) -> dict:
+    """Copy Conductor's training state onto the MAM item once. Same one-shot-
+    per-call contract as lora_pipeline.sync_status_to_mam -- call it on a
+    timer or a button's poll loop, this does not loop itself.
+
+    training_status()'s `state` field is the OK/failed/else-running 3-way
+    bucket _classify() computes, which reads "created" (not yet dispatched)
+    as "running" -- fine for that function's purpose, wrong for provenance,
+    so this reads the raw `status` string directly instead.
+    """
+    status = await training_status(training_id)
+    raw = str(status.get("status") or "").lower()
+    if raw in ("completed", "complete"):
+        mapped = lora_pipeline.STATUS_READY
+    elif raw in ("failed", "killed", "cancelled", "canceled"):
+        mapped = lora_pipeline.STATUS_FAILED
+    elif raw == "created":
+        mapped = lora_pipeline.STATUS_SUBMITTED
+    else:
+        mapped = lora_pipeline.STATUS_RUNNING
+
+    await cantemo.set_metadata(
+        item_id, (await lora_pipeline._writable_provenance_fields({"status": mapped}))[0],
+        group_name=lora_pipeline.PROVENANCE_GROUP)
+    return {"item_id": item_id, "training_id": training_id, "conductor_status": status.get("status"),
+            "mam_status": mapped, "epochs_completed": status.get("epochs_completed")}
+
+
 async def ingest_generated_images(
     inference_id: str,
     prompt: str,
@@ -626,17 +747,46 @@ async def training_status(training_id: str) -> dict:
 
 
 async def training_epochs(training_id: str) -> dict:
-    """Every checkpoint so far, with the sample image each one rendered."""
+    """Every checkpoint so far, with the sample image each one rendered, and
+    the lora_id that checkpoint registered as — that id is what inference
+    actually needs, not the training_id.
+
+    FIXED 2026-09-12 (never exercised against a real completed job until
+    now): the response is {"epochs": [...]}, not {"data": [...]} — this
+    always returned zero rows before. The per-row key is `epoch_number`,
+    not `epoch`, and each row carries its own `lora_id`.
+    """
     pid = await project_id()
     resp = await ai.list_epochs(pid, training_id)
-    rows = resp if isinstance(resp, list) else (resp or {}).get("data") or []
+    rows = (resp or {}).get("epochs") or []
     epochs = [
         {
-            "epoch": r.get("epoch"),
-            "file_name": r.get("file_name"),
+            "epoch": r.get("epoch_number"),
+            "lora_id": r.get("lora_id"),
+            "file_name": (r.get("type_metadata") or {}).get("file_name"),
             "url": r.get("presigned_url") or r.get("url"),
             "asset_id": r.get("asset_id") or r.get("id"),
         }
         for r in rows if isinstance(r, dict)
     ]
     return {"training_id": training_id, "count": len(epochs), "epochs": epochs}
+
+
+async def latest_lora_id(training_id: str) -> str:
+    """The most recently completed epoch's lora_id -- what a "final epoch"
+    generation should actually reference. Resolved live rather than cached
+    anywhere, so a job that trains further epochs later just works.
+
+    Asks for the single newest epoch directly (order_by_asc=False, limit=1)
+    rather than paging through training_epochs() from the start -- the epochs
+    endpoint defaults to 3 per page with no cursor echoed back, so paging
+    forward from epoch 1 on an 8-epoch job would need real pagination this
+    does not need to do.
+    """
+    pid = await project_id()
+    resp = await ai.list_epochs(pid, training_id, limit=1, order_by_asc=False)
+    rows = (resp or {}).get("epochs") or []
+    if not rows or not rows[0].get("lora_id"):
+        raise ai.ConductorAIError("GET", f"/lora-trainings/{training_id}/epochs", 404,
+                                  "No completed epochs yet -- nothing to generate against.")
+    return str(rows[0]["lora_id"])

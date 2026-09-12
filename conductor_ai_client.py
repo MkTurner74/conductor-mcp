@@ -280,10 +280,19 @@ async def list_assets(project_id: str, limit: int = 100) -> Any:
 # --- LoRA training ---------------------------------------------------------
 
 async def submit_training(project_id: str, dataset_ids: list[str], model_id: str,
-                          settings: dict, parent_job_id: str = "") -> Any:
+                          settings: dict, parent_job_id: str = "",
+                          inputs: Optional[dict] = None) -> Any:
+    """
+    dataset_ids/create_dataset is being retired (Conductor, 2026-09-10): submit
+    directly with dataset_ids=[] and `inputs` as {asset_id: caption}. Kept as
+    an optional param rather than replacing dataset_ids outright since
+    Conductor said the field itself is not gone yet, just no longer required.
+    """
     body: dict = {"dataset_ids": dataset_ids, "model_id": model_id, "settings": settings}
     if parent_job_id:
         body["parent_job_id"] = parent_job_id
+    if inputs is not None:
+        body["inputs"] = inputs
     return await _request("POST", f"/core/v1/projects/{project_id}/lora-trainings", json_body=body)
 
 
@@ -296,11 +305,26 @@ async def list_trainings(project_id: str, limit: int = 50) -> Any:
                           params={"limit": limit})
 
 
-async def list_epochs(project_id: str, training_id: str) -> Any:
+async def list_epochs(project_id: str, training_id: str, limit: int = 3,
+                      order_by_asc: bool = True) -> Any:
     """Per-epoch checkpoints with their sample renders — watch it learn, and
     pick the epoch that looks right instead of taking whatever the last one
-    produced. The render path has no equivalent."""
-    return await _request("GET", f"/core/v1/projects/{project_id}/lora-trainings/{training_id}/epochs")
+    produced. The render path has no equivalent.
+
+    PAGINATED, default page size 3 (confirmed via the OpenAPI spec 2026-09-12
+    — not documented in this function until a real 8-epoch job exposed it:
+    the response has no `data`/cursor echoed back, just {"epochs": [...],
+    "has_more": bool}). Ask for order_by_asc=False, limit=1 to get the most
+    recent epoch in one call instead of paging through from the start.
+    """
+    params = {"limit": limit, "order_by_asc": str(order_by_asc).lower()}
+    return await _request(
+        "GET", f"/core/v1/projects/{project_id}/lora-trainings/{training_id}/epochs", params=params)
+
+
+async def get_epoch(project_id: str, training_id: str, epoch_number: int) -> Any:
+    return await _request(
+        "GET", f"/core/v1/projects/{project_id}/lora-trainings/{training_id}/epochs/{epoch_number}")
 
 
 async def training_logs(project_id: str, training_id: str) -> Any:
