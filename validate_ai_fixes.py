@@ -20,7 +20,23 @@ Needs CONDUCTOR_AI_API_KEY in the environment (the 09-08 key expired 09-15).
 import argparse
 import asyncio
 import json
+import os
 import time
+
+
+def _load_dotenv() -> None:
+    """Pick up CONDUCTOR_AI_API_KEY from the gitignored .env next to this file,
+    so the key never has to be typed into a terminal or a chat. Never printed."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding="utf-8-sig"):
+        k, sep, v = line.strip().partition("=")
+        if sep and not k.startswith("#"):
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
 
 import conductor_ai_client as ai
 import conductor_ai_pipeline as pipeline
